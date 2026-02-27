@@ -104,6 +104,18 @@ def GENERIC_RV64 : RISCVProcessorModel<"generic-rv64",
                                         FeatureStdExtI],
                                        GenericTuneFeatures>,
                    GenericTuneInfo;
+def STARBUG_VLIW : RISCVProcessorModel<"starbug-vliw",
+                                       NoSchedModel,
+                                       [Feature32Bit,
+                                        FeatureStdExtI,
+                                        FeatureStdExtM,
+                                        FeatureStdExtA,
+                                        FeatureStdExtC,
+                                        FeatureStdExtZicsr,
+                                        FeatureStdExtZifencei,
+                                        FeatureStarbugVLIW],
+                                       GenericTuneFeatures>,
+                   GenericTuneInfo;
 // Support generic for compatibility with other targets. The triple will be used
 // to change to the appropriate rv32/rv64 version.
 def GENERIC : RISCVTuneProcessorModel<"generic", NoSchedModel>, GenericTuneInfo;

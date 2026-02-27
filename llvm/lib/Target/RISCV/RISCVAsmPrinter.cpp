@@ -317,6 +317,22 @@ void RISCVAsmPrinter::emitInstruction(const MachineInstr *MI) {
   }
 
   switch (MI->getOpcode()) {
+  case RISCV::STARBUG_BUNDLE_HINT: {
+    const int64_t Len = MI->getOperand(0).getImm();
+    MCInst Hint;
+    if (STI->hasStdExtZca()) {
+      Hint.setOpcode(RISCV::C_LI);
+      Hint.addOperand(MCOperand::createReg(RISCV::X0));
+      Hint.addOperand(MCOperand::createImm(Len));
+    } else {
+      Hint.setOpcode(RISCV::ADDI);
+      Hint.addOperand(MCOperand::createReg(RISCV::X0));
+      Hint.addOperand(MCOperand::createReg(RISCV::X0));
+      Hint.addOperand(MCOperand::createImm(Len));
+    }
+    EmitToStreamer(*OutStreamer, Hint);
+    return;
+  }
   case RISCV::HWASAN_CHECK_MEMACCESS_SHORTGRANULES:
     LowerHWASAN_CHECK_MEMACCESS(*MI);
     return;

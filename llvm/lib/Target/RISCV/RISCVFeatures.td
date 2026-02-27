@@ -1794,6 +1794,10 @@ def FeatureExactAssembly
     : SubtargetFeature<"exact-asm", "EnableExactAssembly", "true",
                        "Enable Exact Assembly (Disables Compression and Relaxation)">;
 
+def FeatureStarbugVLIW
+    : SubtargetFeature<"starbug-vliw", "HasStarbugVLIW", "true",
+                       "Enable Starbug VLIW packetization and ILP-first tuning">;
+
 foreach i = {1-31} in
   def FeatureReserveX#i :
       SubtargetFeature<"reserve-x"#i, "UserReservedRegister[RISCV::X"#i#"]",
@@ -2048,4 +2052,3 @@ def TuneSiFive7 : SubtargetFeature<"sifive7", "RISCVProcFamily", "SiFive7",
 
 def TuneVentanaVeyron : SubtargetFeature<"ventana-veyron", "RISCVProcFamily", "VentanaVeyron",
                                          "Ventana Veyron-Series processors">;
-

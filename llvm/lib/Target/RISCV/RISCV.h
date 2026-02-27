@@ -101,6 +101,8 @@ FunctionPass *createRISCVPushPopOptimizationPass();
 void initializeRISCVPushPopOptPass(PassRegistry &);
 FunctionPass *createRISCVLoadStoreOptPass();
 void initializeRISCVLoadStoreOptPass(PassRegistry &);
+FunctionPass *createStarbugVLIWPacketizerPass();
+void initializeStarbugVLIWPacketizerPass(PassRegistry &);
 
 FunctionPass *createRISCVPreAllocZilsdOptPass();
 void initializeRISCVPreAllocZilsdOptPass(PassRegistry &);
