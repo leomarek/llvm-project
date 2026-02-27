@@ -8,6 +8,7 @@
 
 #include "RISCVTargetTransformInfo.h"
 #include "MCTargetDesc/RISCVMatInt.h"
+#include "StarbugVLIWConfig.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/BasicTTIImpl.h"
@@ -18,6 +19,7 @@
 #include "llvm/IR/IntrinsicsRISCV.h"
 #include "llvm/IR/PatternMatch.h"
 #include <cmath>
+#include <limits>
 #include <optional>
 using namespace llvm;
 using namespace llvm::PatternMatch;
@@ -2806,6 +2808,38 @@ InstructionCost RISCVTTIImpl::getPointersChainCost(
 void RISCVTTIImpl::getUnrollingPreferences(
     Loop *L, ScalarEvolution &SE, TTI::UnrollingPreferences &UP,
     OptimizationRemarkEmitter *ORE) const {
+  if (ST->hasStarbugVLIW()) {
+    const auto Cfg = RISCVVLIW::StarbugVLIWConfig::fromCommandLine();
+
+    UP.Threshold = std::max(UP.Threshold, 2000U);
+    UP.PartialThreshold = std::max(UP.PartialThreshold, 2000U);
+    UP.OptSizeThreshold = std::numeric_limits<unsigned>::max();
+    UP.PartialOptSizeThreshold = std::numeric_limits<unsigned>::max();
+
+    UP.Partial = true;
+    UP.Runtime = true;
+    UP.AllowRemainder = true;
+    UP.AllowExpensiveTripCount = true;
+    UP.UpperBound = true;
+    UP.UnrollRemainder = true;
+    UP.UnrollAndJam = Cfg.Unroll.PreferUnrollAndJam;
+    UP.UnrollVectorizedLoop = true;
+    UP.RuntimeUnrollMultiExit = true;
+    UP.AddAdditionalAccumulators = true;
+
+    UP.DefaultUnrollRuntimeCount = Cfg.Unroll.DefaultUnrollFactor;
+    UP.MaxCount = std::max(UP.MaxCount, Cfg.Unroll.MaxUnrollFactor);
+    UP.FullUnrollMaxCount =
+        std::max(UP.FullUnrollMaxCount, Cfg.Unroll.MaxUnrollFactor);
+    UP.MaxIterationsCountToAnalyze =
+        std::max(UP.MaxIterationsCountToAnalyze, Cfg.Unroll.MaxUnrollFactor);
+    if (Cfg.Unroll.ForceUnroll) {
+      UP.Force = true;
+      UP.Count = Cfg.Unroll.DefaultUnrollFactor;
+    }
+    return;
+  }
+
   // TODO: More tuning on benchmarks and metrics with changes as needed
   //       would apply to all settings below to enable performance.
 
