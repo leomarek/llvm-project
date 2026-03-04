@@ -33,8 +33,13 @@ struct LaneConfig {
 
 struct UnrollPolicy {
   bool ForceUnroll = true;
-  unsigned DefaultUnrollFactor = 32;
-  unsigned MaxUnrollFactor = 128;
+  unsigned DefaultUnrollFactor = 64;
+  unsigned MaxUnrollFactor = 512;
+  unsigned Threshold = 100000;
+  unsigned PartialThreshold = 100000;
+  unsigned MaxPercentThresholdBoost = 1000;
+  unsigned UnrollAndJamInnerLoopThreshold = 100000;
+  unsigned SCEVExpansionBudget = 4096;
   bool PreferUnrollAndJam = true;
   bool SpillPressureGuard = true;
 };
@@ -45,7 +50,7 @@ struct SchedulerPolicy {
   unsigned LatencyWeightLoad = 3;
   unsigned LatencyWeightMulDiv = 2;
   unsigned LatencyWeightStore = 1;
-  unsigned PacketizerLookAhead = 24;
+  unsigned PacketizerLookAhead = 64;
   bool ReserveLane0ForAny = true;
   bool AllowShortPackets = true;
   bool EmitSingleInstructionHints = false;

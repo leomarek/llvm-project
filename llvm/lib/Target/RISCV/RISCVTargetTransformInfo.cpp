@@ -2811,8 +2811,10 @@ void RISCVTTIImpl::getUnrollingPreferences(
   if (ST->hasStarbugVLIW()) {
     const auto Cfg = RISCVVLIW::StarbugVLIWConfig::fromCommandLine();
 
-    UP.Threshold = std::max(UP.Threshold, 2000U);
-    UP.PartialThreshold = std::max(UP.PartialThreshold, 2000U);
+    UP.Threshold = std::max(UP.Threshold, Cfg.Unroll.Threshold);
+    UP.PartialThreshold = std::max(UP.PartialThreshold, Cfg.Unroll.PartialThreshold);
+    UP.MaxPercentThresholdBoost =
+        std::max(UP.MaxPercentThresholdBoost, Cfg.Unroll.MaxPercentThresholdBoost);
     UP.OptSizeThreshold = std::numeric_limits<unsigned>::max();
     UP.PartialOptSizeThreshold = std::numeric_limits<unsigned>::max();
 
@@ -2826,9 +2828,15 @@ void RISCVTTIImpl::getUnrollingPreferences(
     UP.UnrollVectorizedLoop = true;
     UP.RuntimeUnrollMultiExit = true;
     UP.AddAdditionalAccumulators = true;
+    UP.UnrollAndJamInnerLoopThreshold =
+        std::max(UP.UnrollAndJamInnerLoopThreshold,
+                 Cfg.Unroll.UnrollAndJamInnerLoopThreshold);
+    UP.SCEVExpansionBudget =
+        std::max(UP.SCEVExpansionBudget, Cfg.Unroll.SCEVExpansionBudget);
 
     UP.DefaultUnrollRuntimeCount = Cfg.Unroll.DefaultUnrollFactor;
     UP.MaxCount = std::max(UP.MaxCount, Cfg.Unroll.MaxUnrollFactor);
+    UP.MaxUpperBound = std::max(UP.MaxUpperBound, Cfg.Unroll.MaxUnrollFactor);
     UP.FullUnrollMaxCount =
         std::max(UP.FullUnrollMaxCount, Cfg.Unroll.MaxUnrollFactor);
     UP.MaxIterationsCountToAnalyze =

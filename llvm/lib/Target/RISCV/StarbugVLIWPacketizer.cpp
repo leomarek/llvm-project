@@ -113,6 +113,10 @@ static OpClass classifyOpClass(const MachineInstr &MI,
     return OpClass::Store;
 
   StringRef Name = TII.getName(MI.getOpcode());
+  if (Name.contains("LW") || Name.contains("LD") || Name.contains("LOAD"))
+    return OpClass::Load;
+  if (Name.contains("SW") || Name.contains("SD") || Name.contains("STORE"))
+    return OpClass::Store;
   if (Name.contains("ADD") || Name.contains("SUB"))
     return OpClass::ALUAddSub;
   if (Name.contains("MUL") || Name.contains("DIV") || Name.contains("REM"))
@@ -129,6 +133,14 @@ static OpClass classifyOpClass(const MachineInstr &MI,
     return OpClass::Compare;
 
   return OpClass::Any;
+}
+
+static bool isLikelyLSUOp(const MachineInstr &MI, const RISCVInstrInfo &TII) {
+  if (MI.mayLoad() || MI.mayStore())
+    return true;
+  StringRef Name = TII.getName(MI.getOpcode());
+  return Name.contains("LW") || Name.contains("LD") || Name.contains("LOAD") ||
+         Name.contains("SW") || Name.contains("SD") || Name.contains("STORE");
 }
 
 static bool mayReorderAcross(const MachineInstr &A, const MachineInstr &B) {
@@ -221,22 +233,24 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     return !isPacketizableMI(MI);
   };
 
-  auto tryAssignLane = [&](OpClass Class) -> int {
+  auto isLaneBusy = [&](ArrayRef<unsigned> UsedLanes, unsigned Lane) {
+    for (unsigned UsedLane : UsedLanes)
+      if (UsedLane == Lane)
+        return true;
+    return false;
+  };
+
+  auto tryAssignLaneWithUsed = [&](OpClass Class,
+                                   ArrayRef<unsigned> UsedLanes) -> int {
     const unsigned NumLanes = Config.maxBundleWidth();
-    auto isLaneBusy = [&](unsigned Lane) {
-      for (unsigned UsedLane : PacketLanes)
-        if (UsedLane == Lane)
-          return true;
-      return false;
-    };
 
     // Prefer non-zero lanes to keep lane 0 available for unrestricted ops.
     if (Config.Scheduler.ReserveLane0ForAny && NumLanes > 1) {
       for (unsigned Lane = 1; Lane < NumLanes; ++Lane) {
-        if (Config.isLaneLegal(Lane, Class) && !isLaneBusy(Lane))
+        if (Config.isLaneLegal(Lane, Class) && !isLaneBusy(UsedLanes, Lane))
           return static_cast<int>(Lane);
       }
-      if (Config.isLaneLegal(0, Class) && !isLaneBusy(0))
+      if (Config.isLaneLegal(0, Class) && !isLaneBusy(UsedLanes, 0))
         return 0;
       return -1;
     }
@@ -244,10 +258,49 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     for (unsigned Lane = 0; Lane < NumLanes; ++Lane) {
       if (!Config.isLaneLegal(Lane, Class))
         continue;
-      if (!isLaneBusy(Lane))
+      if (!isLaneBusy(UsedLanes, Lane))
         return static_cast<int>(Lane);
     }
     return -1;
+  };
+
+  auto tryAssignLane = [&](OpClass Class) -> int {
+    return tryAssignLaneWithUsed(Class, PacketLanes);
+  };
+
+  auto countLaneChoices = [&](OpClass Class, ArrayRef<unsigned> UsedLanes) {
+    const unsigned NumLanes = Config.maxBundleWidth();
+    unsigned NumChoices = 0;
+    for (unsigned Lane = 0; Lane < NumLanes; ++Lane) {
+      if (!Config.isLaneLegal(Lane, Class) || isLaneBusy(UsedLanes, Lane))
+        continue;
+      ++NumChoices;
+    }
+    return NumChoices;
+  };
+
+  auto isLikelyPointerBump = [&](const MachineInstr &MI) {
+    if (!Config.Scheduler.PrioritizePointerBumps)
+      return false;
+    const StringRef Name = TII->getName(MI.getOpcode());
+    if (!Name.contains("ADDI"))
+      return false;
+
+    Register DefReg;
+    Register UseReg;
+    bool HasImm = false;
+    int64_t Imm = 0;
+    for (const MachineOperand &MO : MI.operands()) {
+      if (MO.isReg() && MO.isDef() && !DefReg)
+        DefReg = MO.getReg();
+      if (MO.isReg() && MO.isUse() && !UseReg)
+        UseReg = MO.getReg();
+      if (MO.isImm()) {
+        HasImm = true;
+        Imm = MO.getImm();
+      }
+    }
+    return DefReg && UseReg && DefReg == UseReg && HasImm && Imm != 0;
   };
 
   auto flushPacket = [&]() {
@@ -294,9 +347,20 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
         break;
       }
     }
+    unsigned MemoryOps = 0;
+    int FirstMemoryIndex = -1;
+    for (unsigned I = 0; I < Packet.size(); ++I) {
+      if (!isLikelyLSUOp(*Packet[I], *TII))
+        continue;
+      ++MemoryOps;
+      if (FirstMemoryIndex < 0)
+        FirstMemoryIndex = static_cast<int>(I);
+    }
+    const bool IsLSULegalPacket =
+        MemoryOps <= 1 && (FirstMemoryIndex < 0 || FirstMemoryIndex == 0);
 
     bool ShouldEmitHint = false;
-    if (!HasDenseLanePrefix)
+    if (!HasDenseLanePrefix || !IsLSULegalPacket)
       ShouldEmitHint = false;
     else if (IsFull)
       ShouldEmitHint = true;
@@ -319,9 +383,78 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     PacketDefs.clear();
   };
 
+  auto estimateAdditionalFill = [&](MachineBasicBlock::iterator InsertPos,
+                                    MachineBasicBlock::iterator ChosenIt,
+                                    const DenseSet<Register> &ChosenUses,
+                                    const DenseSet<Register> &ChosenDefs,
+                                    unsigned ChosenLane) {
+    if (Packet.size() + 1 >= Config.maxBundleWidth())
+      return 0U;
+
+    DenseSet<Register> SimUses(PacketUses);
+    DenseSet<Register> SimDefs(PacketDefs);
+    SimUses.insert(ChosenUses.begin(), ChosenUses.end());
+    SimDefs.insert(ChosenDefs.begin(), ChosenDefs.end());
+
+    SmallVector<unsigned, 8> SimLanes(PacketLanes.begin(), PacketLanes.end());
+    SimLanes.push_back(ChosenLane);
+    bool SimHasLSU = false;
+    for (MachineInstr *PMI : Packet)
+      SimHasLSU |= isLikelyLSUOp(*PMI, *TII);
+    SimHasLSU |= isLikelyLSUOp(*ChosenIt, *TII);
+
+    const unsigned LookAhead = std::max(1u, Config.Scheduler.PacketizerLookAhead);
+    unsigned Seen = 0;
+    unsigned Additional = 0;
+
+    for (auto It = InsertPos; It != MBB.end() && Seen < LookAhead; ++It) {
+      if (isBarrier(*It))
+        break;
+      ++Seen;
+      if (It == ChosenIt)
+        continue;
+
+      if (!canHoistCandidate(InsertPos, It, Config.Scheduler.PacketizePCRelative))
+        continue;
+
+      DenseSet<Register> CandUses;
+      DenseSet<Register> CandDefs;
+      collectRegAccesses(*It, CandUses, CandDefs);
+
+      if (hasPacketDependency(CandUses, CandDefs, SimUses, SimDefs))
+        continue;
+
+      const OpClass CandClass = classifyOpClass(*It, *TII);
+      const int CandLane = tryAssignLaneWithUsed(CandClass, SimLanes);
+      if (CandLane < 0)
+        continue;
+      const bool CandIsLSU = isLikelyLSUOp(*It, *TII);
+      if (CandIsLSU && (SimHasLSU || CandLane != 0))
+        continue;
+
+      SimLanes.push_back(static_cast<unsigned>(CandLane));
+      SimUses.insert(CandUses.begin(), CandUses.end());
+      SimDefs.insert(CandDefs.begin(), CandDefs.end());
+      SimHasLSU |= CandIsLSU;
+      ++Additional;
+      if (SimLanes.size() >= Config.maxBundleWidth())
+        break;
+    }
+
+    return Additional;
+  };
+
   auto scoreCandidate = [&](const MachineInstr &MI, OpClass Class,
-                            unsigned Lane, bool IsAtHead) {
+                            unsigned Lane, bool IsAtHead,
+                            unsigned NumLaneChoices,
+                            unsigned AdditionalFill) {
     int Score = 0;
+    // Bias toward candidates that allow this packet to become wider.
+    Score += static_cast<int>(AdditionalFill) * 24;
+    // Schedule constrained-lane ops earlier to avoid painting into a corner.
+    Score += static_cast<int>(Config.maxBundleWidth() - NumLaneChoices) * 7;
+    if (NumLaneChoices == 1)
+      Score += 12;
     if (IsAtHead)
       Score += 3;
     if (Lane != 0)
@@ -332,6 +465,10 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       Score += static_cast<int>(Config.Scheduler.LatencyWeightMulDiv) * 3;
     if (Class == OpClass::Store)
       Score += static_cast<int>(Config.Scheduler.LatencyWeightStore);
+    if (Class == OpClass::Load || Class == OpClass::Store)
+      Score += 6;
+    if (isLikelyPointerBump(MI))
+      Score += 8;
     if (Class == OpClass::Any)
       Score -= 6;
     if (MI.mayLoad())
@@ -374,10 +511,23 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       int CandLane = tryAssignLane(CandClass);
       if (CandLane < 0)
         continue;
+      const bool CandIsLSU = isLikelyLSUOp(*CandIt, *TII);
+      if (CandIsLSU) {
+        bool PacketHasLSU = false;
+        for (MachineInstr *PMI : Packet)
+          PacketHasLSU |= isLikelyLSUOp(*PMI, *TII);
+        if (PacketHasLSU || CandLane != 0)
+          continue;
+      }
+      const unsigned NumLaneChoices = countLaneChoices(CandClass, PacketLanes);
+      const unsigned AdditionalFill =
+          estimateAdditionalFill(MII, CandIt, CandUses, CandDefs,
+                                 static_cast<unsigned>(CandLane));
 
       int CandScore = scoreCandidate(*CandIt, CandClass,
                                      static_cast<unsigned>(CandLane),
-                                     CandIt == MII);
+                                     CandIt == MII, NumLaneChoices,
+                                     AdditionalFill);
       if (BestIt != MBB.end() && CandScore <= BestScore)
         continue;
 

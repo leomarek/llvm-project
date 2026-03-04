@@ -104,6 +104,11 @@ static cl::opt<bool>
                            cl::desc("Enable Machine Pipeliner for RISC-V"),
                            cl::init(false), cl::Hidden);
 
+static cl::opt<bool> EnableStarbugMachinePipeliner(
+    "starbug-vliw-enable-machine-pipeliner", cl::Hidden,
+    cl::desc("Enable Machine Pipeliner by default for Starbug VLIW"),
+    cl::init(true));
+
 static cl::opt<bool> EnableCFIInstrInserter(
     "riscv-enable-cfi-instr-inserter",
     cl::desc("Enable CFI Instruction Inserter for RISC-V"), cl::init(false),
@@ -638,7 +643,12 @@ void RISCVPassConfig::addPreRegAlloc() {
   addPass(createRISCVInsertWriteVXRMPass());
   addPass(createRISCVLandingPadSetupPass());
 
-  if (TM->getOptLevel() != CodeGenOptLevel::None && EnableMachinePipeliner)
+  const bool IsStarbugCPU =
+      getRISCVTargetMachine().getTargetCPU() == "starbug-vliw";
+  const bool UseMachinePipeliner =
+      EnableMachinePipeliner ||
+      (IsStarbugCPU && EnableStarbugMachinePipeliner);
+  if (TM->getOptLevel() != CodeGenOptLevel::None && UseMachinePipeliner)
     addPass(&MachinePipelinerID);
 
   addPass(createRISCVVMV0EliminationPass());

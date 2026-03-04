@@ -91,6 +91,9 @@ class RISCVTuneProcessorModel<string n, SchedMachineModel m,
 
 defvar GenericTuneFeatures = [TuneOptimizedNF2SegmentLoadStore,
                               TuneEnableSelectOptimize];
+defvar StarbugTuneFeatures = [TuneOptimizedNF2SegmentLoadStore,
+                              TuneEnableSelectOptimize,
+                              TunePostRAScheduler];
 
 def GENERIC_RV32 : RISCVProcessorModel<"generic-rv32",
                                        NoSchedModel,
@@ -114,7 +117,7 @@ def STARBUG_VLIW : RISCVProcessorModel<"starbug-vliw",
                                         FeatureStdExtZicsr,
                                         FeatureStdExtZifencei,
                                         FeatureStarbugVLIW],
-                                       GenericTuneFeatures>,
+                                       StarbugTuneFeatures>,
                    GenericTuneInfo;
 // Support generic for compatibility with other targets. The triple will be used
 // to change to the appropriate rv32/rv64 version.

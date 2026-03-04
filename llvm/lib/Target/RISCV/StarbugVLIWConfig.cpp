@@ -18,12 +18,34 @@ static cl::opt<bool> StarbugVForceUnroll(
     cl::desc("Force aggressive loop unrolling for Starbug VLIW"));
 
 static cl::opt<unsigned> StarbugVUnrollFactor(
-    "starbug-vliw-unroll-factor", cl::init(32), cl::Hidden,
+    "starbug-vliw-unroll-factor", cl::init(64), cl::Hidden,
     cl::desc("Preferred loop unroll factor for Starbug VLIW"));
 
 static cl::opt<unsigned> StarbugVMaxUnroll(
-    "starbug-vliw-max-unroll", cl::init(128), cl::Hidden,
+    "starbug-vliw-max-unroll", cl::init(512), cl::Hidden,
     cl::desc("Maximum unroll factor allowed for Starbug VLIW"));
+
+static cl::opt<unsigned> StarbugVUnrollThreshold(
+    "starbug-vliw-unroll-threshold", cl::init(100000), cl::Hidden,
+    cl::desc("Loop unroll threshold override for Starbug VLIW"));
+
+static cl::opt<unsigned> StarbugVPartialUnrollThreshold(
+    "starbug-vliw-partial-unroll-threshold", cl::init(100000), cl::Hidden,
+    cl::desc("Partial/runtime loop unroll threshold override for Starbug VLIW"));
+
+static cl::opt<unsigned> StarbugVUnrollMaxPercentThresholdBoost(
+    "starbug-vliw-unroll-max-percent-threshold-boost", cl::init(1000),
+    cl::Hidden,
+    cl::desc("Max percent threshold boost for full unroll profitability"));
+
+static cl::opt<unsigned> StarbugVUnrollAndJamInnerThreshold(
+    "starbug-vliw-unroll-and-jam-inner-threshold", cl::init(100000),
+    cl::Hidden,
+    cl::desc("Inner-loop threshold for unroll-and-jam profitability"));
+
+static cl::opt<unsigned> StarbugVSCEVExpansionBudget(
+    "starbug-vliw-scev-expansion-budget", cl::init(4096), cl::Hidden,
+    cl::desc("SCEV expansion budget for runtime unroll analysis"));
 
 static cl::opt<std::string> StarbugVLaneOpClasses(
     "starbug-vliw-lane-op-classes", cl::init(""), cl::Hidden,
@@ -40,7 +62,7 @@ static cl::opt<bool> StarbugVPacketizePCRel(
     cl::desc("Allow packetizing PC-relative address setup instructions"));
 
 static cl::opt<unsigned> StarbugVPacketizerLookAhead(
-    "starbug-vliw-packetizer-lookahead", cl::init(24), cl::Hidden,
+    "starbug-vliw-packetizer-lookahead", cl::init(64), cl::Hidden,
     cl::desc("Max forward search window for filling Starbug VLIW packets"));
 
 static cl::opt<bool> StarbugVReserveLane0(
@@ -175,14 +197,19 @@ StarbugVLIWConfig StarbugVLIWConfig::getDefault() {
   Cfg.Lanes.push_back(makeALULane(3));
 
   Cfg.Unroll.ForceUnroll = true;
-  Cfg.Unroll.DefaultUnrollFactor = 32;
-  Cfg.Unroll.MaxUnrollFactor = 128;
+  Cfg.Unroll.DefaultUnrollFactor = 64;
+  Cfg.Unroll.MaxUnrollFactor = 512;
+  Cfg.Unroll.Threshold = 100000;
+  Cfg.Unroll.PartialThreshold = 100000;
+  Cfg.Unroll.MaxPercentThresholdBoost = 1000;
+  Cfg.Unroll.UnrollAndJamInnerLoopThreshold = 100000;
+  Cfg.Unroll.SCEVExpansionBudget = 4096;
   Cfg.Unroll.PreferUnrollAndJam = true;
   Cfg.Unroll.SpillPressureGuard = true;
 
   Cfg.Scheduler.PrioritizePointerBumps = true;
   Cfg.Scheduler.PrioritizeReadyLoads = true;
-  Cfg.Scheduler.PacketizerLookAhead = 24;
+  Cfg.Scheduler.PacketizerLookAhead = 64;
   Cfg.Scheduler.ReserveLane0ForAny = true;
   Cfg.Scheduler.AllowShortPackets = true;
   Cfg.Scheduler.EmitSingleInstructionHints = false;
@@ -198,6 +225,14 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
   Cfg.Unroll.ForceUnroll = StarbugVForceUnroll;
   Cfg.Unroll.DefaultUnrollFactor = StarbugVUnrollFactor;
   Cfg.Unroll.MaxUnrollFactor = StarbugVMaxUnroll;
+  Cfg.Unroll.Threshold = StarbugVUnrollThreshold;
+  Cfg.Unroll.PartialThreshold = StarbugVPartialUnrollThreshold;
+  Cfg.Unroll.MaxPercentThresholdBoost =
+      std::max(100u, StarbugVUnrollMaxPercentThresholdBoost.getValue());
+  Cfg.Unroll.UnrollAndJamInnerLoopThreshold =
+      StarbugVUnrollAndJamInnerThreshold;
+  Cfg.Unroll.SCEVExpansionBudget =
+      std::max(1u, StarbugVSCEVExpansionBudget.getValue());
   if (Cfg.Unroll.DefaultUnrollFactor == 0)
     Cfg.Unroll.DefaultUnrollFactor = 1;
   Cfg.Unroll.MaxUnrollFactor =
