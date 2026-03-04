@@ -66,6 +66,7 @@ add_llvm_target(RISCVCodeGen
   RISCVSelectionDAGInfo.cpp
   StarbugVLIWConfig.cpp
   StarbugVLIWPacketizer.cpp
+  StarbugVLIWTraceScheduler.cpp
   RISCVSubtarget.cpp
   RISCVTargetMachine.cpp
   RISCVTargetObjectFile.cpp

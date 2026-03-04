@@ -109,6 +109,11 @@ static cl::opt<bool> EnableStarbugMachinePipeliner(
     cl::desc("Enable Machine Pipeliner by default for Starbug VLIW"),
     cl::init(true));
 
+static cl::opt<bool> EnableStarbugTraceScheduler(
+    "starbug-vliw-enable-trace-scheduler", cl::Hidden,
+    cl::desc("Enable experimental generic pre-RA trace staging for Starbug VLIW"),
+    cl::init(false));
+
 static cl::opt<bool> EnableCFIInstrInserter(
     "riscv-enable-cfi-instr-inserter",
     cl::desc("Enable CFI Instruction Inserter for RISC-V"), cl::init(false),
@@ -153,6 +158,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVIndirectBranchTrackingPass(*PR);
   initializeRISCVLoadStoreOptPass(*PR);
   initializeStarbugVLIWPacketizerPass(*PR);
+  initializeStarbugVLIWTraceSchedulerPass(*PR);
   initializeRISCVPreAllocZilsdOptPass(*PR);
   initializeRISCVExpandAtomicPseudoPass(*PR);
   initializeRISCVRedundantCopyEliminationPass(*PR);
@@ -645,6 +651,8 @@ void RISCVPassConfig::addPreRegAlloc() {
 
   const bool IsStarbugCPU =
       getRISCVTargetMachine().getTargetCPU() == "starbug-vliw";
+  if (IsStarbugCPU && EnableStarbugTraceScheduler)
+    addPass(createStarbugVLIWTraceSchedulerPass());
   const bool UseMachinePipeliner =
       EnableMachinePipeliner ||
       (IsStarbugCPU && EnableStarbugMachinePipeliner);
