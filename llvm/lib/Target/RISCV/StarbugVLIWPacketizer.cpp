@@ -12,6 +12,7 @@
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Target/TargetMachine.h"
+#include <limits>
 
 using namespace llvm;
 
@@ -128,6 +129,47 @@ static OpClass classifyOpClass(const MachineInstr &MI,
   return OpClass::Any;
 }
 
+static bool mayReorderAcross(const MachineInstr &A, const MachineInstr &B) {
+  // Conservative memory ordering model: do not move stores across memory ops,
+  // and do not move loads above older stores.
+  if ((A.mayStore() && (B.mayLoad() || B.mayStore())) ||
+      (A.mayLoad() && B.mayStore()))
+    return false;
+  return true;
+}
+
+static bool canHoistCandidate(MachineBasicBlock::iterator InsertPos,
+                              MachineBasicBlock::iterator CandIt,
+                              bool PacketizePCRelative) {
+  if (InsertPos == CandIt)
+    return true;
+
+  const MachineInstr &Cand = *CandIt;
+  DenseSet<Register> CandUses;
+  DenseSet<Register> CandDefs;
+  collectRegAccesses(Cand, CandUses, CandDefs);
+
+  for (auto It = InsertPos; It != CandIt; ++It) {
+    const MachineInstr &Intervening = *It;
+    if ((!PacketizePCRelative && isPCRelativeSetupMI(Intervening)) ||
+        !isPacketizableMI(Intervening))
+      return false;
+
+    DenseSet<Register> IUses;
+    DenseSet<Register> IDefs;
+    collectRegAccesses(Intervening, IUses, IDefs);
+
+    if (hasPacketDependency(CandUses, CandDefs, IUses, IDefs) ||
+        hasPacketDependency(IUses, IDefs, CandUses, CandDefs))
+      return false;
+
+    if (!mayReorderAcross(Cand, Intervening))
+      return false;
+  }
+
+  return true;
+}
+
 } // namespace
 
 char StarbugVLIWPacketizer::ID = 0;
@@ -171,20 +213,36 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
   DenseSet<Register> PacketUses;
   DenseSet<Register> PacketDefs;
 
+  auto isBarrier = [&](const MachineInstr &MI) {
+    if (!Config.Scheduler.PacketizePCRelative && isPCRelativeSetupMI(MI))
+      return true;
+    return !isPacketizableMI(MI);
+  };
+
   auto tryAssignLane = [&](OpClass Class) -> int {
     const unsigned NumLanes = Config.maxBundleWidth();
+    auto isLaneBusy = [&](unsigned Lane) {
+      for (unsigned UsedLane : PacketLanes)
+        if (UsedLane == Lane)
+          return true;
+      return false;
+    };
+
+    // Prefer non-zero lanes to keep lane 0 available for unrestricted ops.
+    if (Config.Scheduler.ReserveLane0ForAny && NumLanes > 1) {
+      for (unsigned Lane = 1; Lane < NumLanes; ++Lane) {
+        if (Config.isLaneLegal(Lane, Class) && !isLaneBusy(Lane))
+          return static_cast<int>(Lane);
+      }
+      if (Config.isLaneLegal(0, Class) && !isLaneBusy(0))
+        return 0;
+      return -1;
+    }
+
     for (unsigned Lane = 0; Lane < NumLanes; ++Lane) {
       if (!Config.isLaneLegal(Lane, Class))
         continue;
-
-      bool LaneBusy = false;
-      for (unsigned UsedLane : PacketLanes) {
-        if (UsedLane == Lane) {
-          LaneBusy = true;
-          break;
-        }
-      }
-      if (!LaneBusy)
+      if (!isLaneBusy(Lane))
         return static_cast<int>(Lane);
     }
     return -1;
@@ -220,40 +278,101 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     PacketDefs.clear();
   };
 
-  for (MachineInstr &MI : MBB) {
-    if (!Config.Scheduler.PacketizePCRelative && isPCRelativeSetupMI(MI)) {
+  auto scoreCandidate = [&](const MachineInstr &MI, OpClass Class,
+                            unsigned Lane, bool IsAtHead) {
+    int Score = 0;
+    if (IsAtHead)
+      Score += 3;
+    if (Lane != 0)
+      Score += 10;
+    if (Class == OpClass::Load && Config.Scheduler.PrioritizeReadyLoads)
+      Score += static_cast<int>(Config.Scheduler.LatencyWeightLoad) * 4;
+    if (Class == OpClass::ALUMulDiv)
+      Score += static_cast<int>(Config.Scheduler.LatencyWeightMulDiv) * 3;
+    if (Class == OpClass::Store)
+      Score += static_cast<int>(Config.Scheduler.LatencyWeightStore);
+    if (Class == OpClass::Any)
+      Score -= 6;
+    if (MI.mayLoad())
+      Score += 2;
+    return Score;
+  };
+
+  for (auto MII = MBB.begin(); MII != MBB.end();) {
+    if (isBarrier(*MII)) {
       flushPacket();
+      ++MII;
       continue;
     }
 
-    if (!isPacketizableMI(MI)) {
-      flushPacket();
+    auto BestIt = MBB.end();
+    DenseSet<Register> BestUses;
+    DenseSet<Register> BestDefs;
+    OpClass BestClass = OpClass::Any;
+    int BestScore = std::numeric_limits<int>::min();
+
+    unsigned LookAhead = std::max(1u, Config.Scheduler.PacketizerLookAhead);
+    unsigned Seen = 0;
+    for (auto CandIt = MII; CandIt != MBB.end() && Seen < LookAhead; ++CandIt) {
+      if (isBarrier(*CandIt))
+        break;
+      ++Seen;
+
+      if (!canHoistCandidate(MII, CandIt, Config.Scheduler.PacketizePCRelative))
+        continue;
+
+      DenseSet<Register> CandUses;
+      DenseSet<Register> CandDefs;
+      collectRegAccesses(*CandIt, CandUses, CandDefs);
+
+      if (!Packet.empty() &&
+          hasPacketDependency(CandUses, CandDefs, PacketUses, PacketDefs))
+        continue;
+
+      OpClass CandClass = classifyOpClass(*CandIt, *TII);
+      int CandLane = tryAssignLane(CandClass);
+      if (CandLane < 0)
+        continue;
+
+      int CandScore = scoreCandidate(*CandIt, CandClass,
+                                     static_cast<unsigned>(CandLane),
+                                     CandIt == MII);
+      if (BestIt != MBB.end() && CandScore <= BestScore)
+        continue;
+
+      BestIt = CandIt;
+      BestUses = std::move(CandUses);
+      BestDefs = std::move(CandDefs);
+      BestClass = CandClass;
+      BestScore = CandScore;
+    }
+
+    if (BestIt == MBB.end()) {
+      if (Packet.empty())
+        ++MII; // No legal lane/candidate even for an empty packet.
+      else
+        flushPacket();
       continue;
     }
 
-    DenseSet<Register> MIUses;
-    DenseSet<Register> MIDefs;
-    collectRegAccesses(MI, MIUses, MIDefs);
-
-    if (!Packet.empty() &&
-        hasPacketDependency(MIUses, MIDefs, PacketUses, PacketDefs)) {
-      flushPacket();
+    if (BestIt != MII) {
+      MBB.splice(MII, &MBB, BestIt);
+      Changed = true;
     }
 
-    OpClass Class = classifyOpClass(MI, *TII);
-    int Lane = tryAssignLane(Class);
+    MachineInstr &Scheduled = *MII;
+    int Lane = tryAssignLane(BestClass);
     if (Lane < 0) {
       flushPacket();
-      Lane = tryAssignLane(Class);
+      continue;
     }
 
-    if (Lane < 0)
-      continue;
-
-    Packet.push_back(&MI);
+    Packet.push_back(&Scheduled);
     PacketLanes.push_back(static_cast<unsigned>(Lane));
-    PacketUses.insert(MIUses.begin(), MIUses.end());
-    PacketDefs.insert(MIDefs.begin(), MIDefs.end());
+    PacketUses.insert(BestUses.begin(), BestUses.end());
+    PacketDefs.insert(BestDefs.begin(), BestDefs.end());
+
+    ++MII;
 
     if (Packet.size() >= Config.maxBundleWidth())
       flushPacket();

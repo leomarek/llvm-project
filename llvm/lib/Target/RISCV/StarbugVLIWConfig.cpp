@@ -39,6 +39,14 @@ static cl::opt<bool> StarbugVPacketizePCRel(
     "starbug-vliw-packetize-pcrel", cl::init(false), cl::Hidden,
     cl::desc("Allow packetizing PC-relative address setup instructions"));
 
+static cl::opt<unsigned> StarbugVPacketizerLookAhead(
+    "starbug-vliw-packetizer-lookahead", cl::init(24), cl::Hidden,
+    cl::desc("Max forward search window for filling Starbug VLIW packets"));
+
+static cl::opt<bool> StarbugVReserveLane0(
+    "starbug-vliw-reserve-lane0-for-any", cl::init(true), cl::Hidden,
+    cl::desc("Prefer non-zero lanes for ALU ops to keep lane 0 open for any-op"));
+
 LaneConfig::LaneConfig() = default;
 
 LaneConfig::LaneConfig(unsigned LaneId, unsigned NumClasses)
@@ -174,6 +182,8 @@ StarbugVLIWConfig StarbugVLIWConfig::getDefault() {
 
   Cfg.Scheduler.PrioritizePointerBumps = true;
   Cfg.Scheduler.PrioritizeReadyLoads = true;
+  Cfg.Scheduler.PacketizerLookAhead = 24;
+  Cfg.Scheduler.ReserveLane0ForAny = true;
   Cfg.Scheduler.AllowShortPackets = true;
   Cfg.Scheduler.EmitSingleInstructionHints = false;
   Cfg.Scheduler.PacketizePCRelative = false;
@@ -192,6 +202,8 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
     Cfg.Unroll.DefaultUnrollFactor = 1;
   Cfg.Unroll.MaxUnrollFactor =
       std::max(Cfg.Unroll.MaxUnrollFactor, Cfg.Unroll.DefaultUnrollFactor);
+  Cfg.Scheduler.PacketizerLookAhead = std::max(1u, StarbugVPacketizerLookAhead.getValue());
+  Cfg.Scheduler.ReserveLane0ForAny = StarbugVReserveLane0;
   Cfg.Scheduler.EmitSingleInstructionHints = StarbugVEmitSingleHints;
   Cfg.Scheduler.PacketizePCRelative = StarbugVPacketizePCRel;
 

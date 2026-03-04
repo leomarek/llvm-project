@@ -45,6 +45,8 @@ struct SchedulerPolicy {
   unsigned LatencyWeightLoad = 3;
   unsigned LatencyWeightMulDiv = 2;
   unsigned LatencyWeightStore = 1;
+  unsigned PacketizerLookAhead = 24;
+  bool ReserveLane0ForAny = true;
   bool AllowShortPackets = true;
   bool EmitSingleInstructionHints = false;
   bool PacketizePCRelative = false;
