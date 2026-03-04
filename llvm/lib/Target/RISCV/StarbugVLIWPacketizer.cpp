@@ -12,7 +12,9 @@
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Target/TargetMachine.h"
+#include <algorithm>
 #include <limits>
+#include <numeric>
 
 using namespace llvm;
 
@@ -252,12 +254,51 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     if (Packet.empty())
       return;
 
+    // The emitted instruction order after STARBUG_BUNDLE_HINT defines lane
+    // slots in hardware. Reorder packet members by chosen lane so lane 0 op
+    // is emitted first, lane 1 second, etc.
+    SmallVector<unsigned, 8> PacketOrder(Packet.size());
+    std::iota(PacketOrder.begin(), PacketOrder.end(), 0);
+    llvm::stable_sort(PacketOrder, [&](unsigned LHS, unsigned RHS) {
+      return PacketLanes[LHS] < PacketLanes[RHS];
+    });
+
+    auto InsertPos = Packet.front()->getIterator();
+    for (unsigned Idx : PacketOrder) {
+      MachineInstr *MI = Packet[Idx];
+      if (MI->getIterator() != InsertPos) {
+        MBB.splice(InsertPos, &MBB, MI->getIterator());
+        Changed = true;
+      }
+      ++InsertPos;
+    }
+
+    SmallVector<MachineInstr *, 8> SortedPacket;
+    SmallVector<unsigned, 8> SortedPacketLanes;
+    SortedPacket.reserve(Packet.size());
+    SortedPacketLanes.reserve(PacketLanes.size());
+    for (unsigned Idx : PacketOrder) {
+      SortedPacket.push_back(Packet[Idx]);
+      SortedPacketLanes.push_back(PacketLanes[Idx]);
+    }
+    Packet.swap(SortedPacket);
+    PacketLanes.swap(SortedPacketLanes);
+
     const size_t PacketSize = Packet.size();
     const bool IsSingle = PacketSize == 1;
     const bool IsFull = PacketSize == Config.maxBundleWidth();
+    bool HasDenseLanePrefix = true;
+    for (unsigned Lane = 0; Lane < PacketLanes.size(); ++Lane) {
+      if (PacketLanes[Lane] != Lane) {
+        HasDenseLanePrefix = false;
+        break;
+      }
+    }
 
     bool ShouldEmitHint = false;
-    if (IsFull)
+    if (!HasDenseLanePrefix)
+      ShouldEmitHint = false;
+    else if (IsFull)
       ShouldEmitHint = true;
     else if (!IsSingle && Config.Scheduler.AllowShortPackets)
       ShouldEmitHint = true;
