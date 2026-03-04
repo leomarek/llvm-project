@@ -2,6 +2,7 @@
 
 #include "RISCV.h"
 #include "RISCVSubtarget.h"
+#include "MCTargetDesc/RISCVBaseInfo.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -34,6 +35,35 @@ static bool isPacketizableMI(const MachineInstr &MI) {
     return false;
 
   return true;
+}
+
+static bool hasPCRelocationOperand(const MachineInstr &MI) {
+  for (const MachineOperand &MO : MI.operands()) {
+    const unsigned DirectTF =
+        MO.getTargetFlags() & RISCVII::MO_DIRECT_FLAG_MASK;
+    switch (DirectTF) {
+    case RISCVII::MO_CALL:
+    case RISCVII::MO_PCREL_LO:
+    case RISCVII::MO_PCREL_HI:
+    case RISCVII::MO_GOT_HI:
+    case RISCVII::MO_TLS_GOT_HI:
+    case RISCVII::MO_TLS_GD_HI:
+    case RISCVII::MO_TLSDESC_HI:
+    case RISCVII::MO_TLSDESC_LOAD_LO:
+    case RISCVII::MO_TLSDESC_ADD_LO:
+    case RISCVII::MO_TLSDESC_CALL:
+      return true;
+    default:
+      break;
+    }
+  }
+  return false;
+}
+
+static bool isPCRelativeSetupMI(const MachineInstr &MI) {
+  if (MI.getOpcode() == RISCV::AUIPC)
+    return true;
+  return hasPCRelocationOperand(MI);
 }
 
 static void collectRegAccesses(const MachineInstr &MI, DenseSet<Register> &Uses,
@@ -191,6 +221,11 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
   };
 
   for (MachineInstr &MI : MBB) {
+    if (!Config.Scheduler.PacketizePCRelative && isPCRelativeSetupMI(MI)) {
+      flushPacket();
+      continue;
+    }
+
     if (!isPacketizableMI(MI)) {
       flushPacket();
       continue;

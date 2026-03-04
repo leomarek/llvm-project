@@ -47,6 +47,7 @@ struct SchedulerPolicy {
   unsigned LatencyWeightStore = 1;
   bool AllowShortPackets = true;
   bool EmitSingleInstructionHints = false;
+  bool PacketizePCRelative = false;
 };
 
 struct StarbugVLIWConfig {

@@ -35,6 +35,10 @@ static cl::opt<bool> StarbugVEmitSingleHints(
     "starbug-vliw-emit-single-hints", cl::init(false), cl::Hidden,
     cl::desc("Emit STARBUG_BUNDLE_HINT for single-instruction packets"));
 
+static cl::opt<bool> StarbugVPacketizePCRel(
+    "starbug-vliw-packetize-pcrel", cl::init(false), cl::Hidden,
+    cl::desc("Allow packetizing PC-relative address setup instructions"));
+
 LaneConfig::LaneConfig() = default;
 
 LaneConfig::LaneConfig(unsigned LaneId, unsigned NumClasses)
@@ -172,6 +176,7 @@ StarbugVLIWConfig StarbugVLIWConfig::getDefault() {
   Cfg.Scheduler.PrioritizeReadyLoads = true;
   Cfg.Scheduler.AllowShortPackets = true;
   Cfg.Scheduler.EmitSingleInstructionHints = false;
+  Cfg.Scheduler.PacketizePCRelative = false;
 
   return Cfg;
 }
@@ -188,6 +193,7 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
   Cfg.Unroll.MaxUnrollFactor =
       std::max(Cfg.Unroll.MaxUnrollFactor, Cfg.Unroll.DefaultUnrollFactor);
   Cfg.Scheduler.EmitSingleInstructionHints = StarbugVEmitSingleHints;
+  Cfg.Scheduler.PacketizePCRelative = StarbugVPacketizePCRel;
 
   // TODO: Replace this with generated config loading from YAML-derived data.
   // For now, expand lane vector using lane0-any + ALU-only lanes.
