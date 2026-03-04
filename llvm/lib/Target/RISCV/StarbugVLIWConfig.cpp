@@ -65,9 +65,29 @@ static cl::opt<unsigned> StarbugVPacketizerLookAhead(
     "starbug-vliw-packetizer-lookahead", cl::init(64), cl::Hidden,
     cl::desc("Max forward search window for filling Starbug VLIW packets"));
 
+static cl::opt<unsigned> StarbugVDependencyLookback(
+    "starbug-vliw-dependency-lookback", cl::init(48), cl::Hidden,
+    cl::desc("Backward search window for producer/consumer pairing heuristics"));
+
 static cl::opt<bool> StarbugVReserveLane0(
     "starbug-vliw-reserve-lane0-for-any", cl::init(true), cl::Hidden,
     cl::desc("Prefer non-zero lanes for ALU ops to keep lane 0 open for any-op"));
+
+static cl::opt<bool> StarbugVPreferLSUAnchoredPackets(
+    "starbug-vliw-prefer-lsu-anchored-packets", cl::init(true), cl::Hidden,
+    cl::desc("Prefer LSU operations as packet anchors to overlap memory and compute"));
+
+static cl::opt<bool> StarbugVPreferMACOverlap(
+    "starbug-vliw-prefer-mac-overlap", cl::init(true), cl::Hidden,
+    cl::desc("Prefer mul/add/store producer-consumer chains for MAC-style overlap"));
+
+static cl::opt<bool> StarbugVAssumeNoMemoryAlias(
+    "starbug-vliw-assume-no-memory-alias", cl::init(false), cl::Hidden,
+    cl::desc("Allow load/store reordering in packetizer assuming input/output do not alias"));
+
+static cl::opt<bool> StarbugVAssumeDisjointMemory(
+    "starbug-vliw-assume-disjoint-memory", cl::init(false), cl::Hidden,
+    cl::desc("Allow load/store reordering in packetizer when stream bases are disjoint"));
 
 LaneConfig::LaneConfig() = default;
 
@@ -209,7 +229,11 @@ StarbugVLIWConfig StarbugVLIWConfig::getDefault() {
 
   Cfg.Scheduler.PrioritizePointerBumps = true;
   Cfg.Scheduler.PrioritizeReadyLoads = true;
+  Cfg.Scheduler.PreferLSUAnchoredPackets = true;
+  Cfg.Scheduler.PreferMACOverlap = true;
+  Cfg.Scheduler.AssumeNoMemoryAlias = false;
   Cfg.Scheduler.PacketizerLookAhead = 64;
+  Cfg.Scheduler.DependencyLookback = 48;
   Cfg.Scheduler.ReserveLane0ForAny = true;
   Cfg.Scheduler.AllowShortPackets = true;
   Cfg.Scheduler.EmitSingleInstructionHints = false;
@@ -238,7 +262,12 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
   Cfg.Unroll.MaxUnrollFactor =
       std::max(Cfg.Unroll.MaxUnrollFactor, Cfg.Unroll.DefaultUnrollFactor);
   Cfg.Scheduler.PacketizerLookAhead = std::max(1u, StarbugVPacketizerLookAhead.getValue());
+  Cfg.Scheduler.DependencyLookback = std::max(1u, StarbugVDependencyLookback.getValue());
   Cfg.Scheduler.ReserveLane0ForAny = StarbugVReserveLane0;
+  Cfg.Scheduler.PreferLSUAnchoredPackets = StarbugVPreferLSUAnchoredPackets;
+  Cfg.Scheduler.PreferMACOverlap = StarbugVPreferMACOverlap;
+  Cfg.Scheduler.AssumeNoMemoryAlias =
+      StarbugVAssumeNoMemoryAlias || StarbugVAssumeDisjointMemory;
   Cfg.Scheduler.EmitSingleInstructionHints = StarbugVEmitSingleHints;
   Cfg.Scheduler.PacketizePCRelative = StarbugVPacketizePCRel;
 

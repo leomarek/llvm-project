@@ -47,10 +47,14 @@ struct UnrollPolicy {
 struct SchedulerPolicy {
   bool PrioritizePointerBumps = true;
   bool PrioritizeReadyLoads = true;
+  bool PreferLSUAnchoredPackets = true;
+  bool PreferMACOverlap = true;
+  bool AssumeNoMemoryAlias = false;
   unsigned LatencyWeightLoad = 3;
   unsigned LatencyWeightMulDiv = 2;
   unsigned LatencyWeightStore = 1;
   unsigned PacketizerLookAhead = 64;
+  unsigned DependencyLookback = 48;
   bool ReserveLane0ForAny = true;
   bool AllowShortPackets = true;
   bool EmitSingleInstructionHints = false;

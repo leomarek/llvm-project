@@ -135,6 +135,18 @@ static OpClass classifyOpClass(const MachineInstr &MI,
   return OpClass::Any;
 }
 
+static Register getMemoryBaseReg(const MachineInstr &MI) {
+  for (int I = static_cast<int>(MI.getNumOperands()) - 1; I >= 0; --I) {
+    const MachineOperand &MO = MI.getOperand(I);
+    if (!MO.isReg() || !MO.isUse())
+      continue;
+    Register Reg = MO.getReg();
+    if (Reg)
+      return Reg;
+  }
+  return Register();
+}
+
 static bool isLikelyLSUOp(const MachineInstr &MI, const RISCVInstrInfo &TII) {
   if (MI.mayLoad() || MI.mayStore())
     return true;
@@ -143,18 +155,28 @@ static bool isLikelyLSUOp(const MachineInstr &MI, const RISCVInstrInfo &TII) {
          Name.contains("SW") || Name.contains("SD") || Name.contains("STORE");
 }
 
-static bool mayReorderAcross(const MachineInstr &A, const MachineInstr &B) {
+static bool mayReorderAcross(const MachineInstr &A, const MachineInstr &B,
+                             bool AssumeNoMemoryAlias) {
   // Conservative memory ordering model: do not move stores across memory ops,
-  // and do not move loads above older stores.
+  // and do not move loads above older stores unless we explicitly opt into
+  // aggressive no-alias scheduling and can see disjoint base registers.
   if ((A.mayStore() && (B.mayLoad() || B.mayStore())) ||
-      (A.mayLoad() && B.mayStore()))
+      (A.mayLoad() && B.mayStore() && !AssumeNoMemoryAlias))
     return false;
+  if (A.mayLoad() && B.mayStore() && AssumeNoMemoryAlias) {
+    Register LoadBase = getMemoryBaseReg(A);
+    Register StoreBase = getMemoryBaseReg(B);
+    // Still conservative when base is unknown or matches.
+    if (!LoadBase || !StoreBase || LoadBase == StoreBase)
+      return false;
+  }
   return true;
 }
 
 static bool canHoistCandidate(MachineBasicBlock::iterator InsertPos,
                               MachineBasicBlock::iterator CandIt,
-                              bool PacketizePCRelative) {
+                              bool PacketizePCRelative,
+                              bool AssumeNoMemoryAlias) {
   if (InsertPos == CandIt)
     return true;
 
@@ -177,7 +199,7 @@ static bool canHoistCandidate(MachineBasicBlock::iterator InsertPos,
         hasPacketDependency(IUses, IDefs, CandUses, CandDefs))
       return false;
 
-    if (!mayReorderAcross(Cand, Intervening))
+    if (!mayReorderAcross(Cand, Intervening, AssumeNoMemoryAlias))
       return false;
   }
 
@@ -414,7 +436,8 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       if (It == ChosenIt)
         continue;
 
-      if (!canHoistCandidate(InsertPos, It, Config.Scheduler.PacketizePCRelative))
+      if (!canHoistCandidate(InsertPos, It, Config.Scheduler.PacketizePCRelative,
+                             Config.Scheduler.AssumeNoMemoryAlias))
         continue;
 
       DenseSet<Register> CandUses;
@@ -444,10 +467,40 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     return Additional;
   };
 
+  auto hasRecentProducerUse = [&](MachineBasicBlock::iterator InsertPos,
+                                  const DenseSet<Register> &CandUses,
+                                  OpClass ProducerClass) {
+    const unsigned Lookback =
+        std::max(1u, Config.Scheduler.DependencyLookback);
+    unsigned Seen = 0;
+    for (auto It = InsertPos; It != MBB.begin() && Seen < Lookback;) {
+      --It;
+      if (isBarrier(*It))
+        break;
+
+      DenseSet<Register> PrevUses;
+      DenseSet<Register> PrevDefs;
+      collectRegAccesses(*It, PrevUses, PrevDefs);
+      ++Seen;
+      if (PrevDefs.empty())
+        continue;
+      if (classifyOpClass(*It, *TII) != ProducerClass)
+        continue;
+      for (Register Reg : PrevDefs) {
+        if (CandUses.contains(Reg))
+          return true;
+      }
+    }
+    return false;
+  };
+
   auto scoreCandidate = [&](const MachineInstr &MI, OpClass Class,
                             unsigned Lane, bool IsAtHead,
                             unsigned NumLaneChoices,
-                            unsigned AdditionalFill) {
+                            unsigned AdditionalFill, bool PacketHasLSU,
+                            bool IsLSU,
+                            MachineBasicBlock::iterator InsertPos,
+                            const DenseSet<Register> &CandUses) {
     int Score = 0;
     // Bias toward candidates that allow this packet to become wider.
     Score += static_cast<int>(AdditionalFill) * 24;
@@ -469,6 +522,34 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       Score += 6;
     if (isLikelyPointerBump(MI))
       Score += 8;
+    if (Config.Scheduler.PreferLSUAnchoredPackets) {
+      if (Packet.empty()) {
+        if (IsLSU)
+          Score += 40;
+        else
+          Score -= 20;
+      } else if (PacketHasLSU && !IsLSU) {
+        // Prefer using non-LSU lanes while LSU lane is occupied by the anchor.
+        if (Class == OpClass::ALUMulDiv)
+          Score += 24;
+        else if (Class == OpClass::ALUAddSub)
+          Score += 20;
+        else
+          Score += 8;
+      }
+    }
+    if (Config.Scheduler.PreferMACOverlap) {
+      // Build an LSU->MUL->ADD->STORE stream when dependencies allow.
+      if (Class == OpClass::ALUMulDiv &&
+          hasRecentProducerUse(InsertPos, CandUses, OpClass::Load))
+        Score += 30;
+      if (Class == OpClass::ALUAddSub &&
+          hasRecentProducerUse(InsertPos, CandUses, OpClass::ALUMulDiv))
+        Score += 34;
+      if (Class == OpClass::Store &&
+          hasRecentProducerUse(InsertPos, CandUses, OpClass::ALUAddSub))
+        Score += 18;
+    }
     if (Class == OpClass::Any)
       Score -= 6;
     if (MI.mayLoad())
@@ -488,6 +569,10 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     DenseSet<Register> BestDefs;
     OpClass BestClass = OpClass::Any;
     int BestScore = std::numeric_limits<int>::min();
+    const bool PacketHasLSU =
+        llvm::any_of(Packet, [&](const MachineInstr *PMI) {
+          return isLikelyLSUOp(*PMI, *TII);
+        });
 
     unsigned LookAhead = std::max(1u, Config.Scheduler.PacketizerLookAhead);
     unsigned Seen = 0;
@@ -496,7 +581,8 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
         break;
       ++Seen;
 
-      if (!canHoistCandidate(MII, CandIt, Config.Scheduler.PacketizePCRelative))
+      if (!canHoistCandidate(MII, CandIt, Config.Scheduler.PacketizePCRelative,
+                             Config.Scheduler.AssumeNoMemoryAlias))
         continue;
 
       DenseSet<Register> CandUses;
@@ -513,9 +599,6 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
         continue;
       const bool CandIsLSU = isLikelyLSUOp(*CandIt, *TII);
       if (CandIsLSU) {
-        bool PacketHasLSU = false;
-        for (MachineInstr *PMI : Packet)
-          PacketHasLSU |= isLikelyLSUOp(*PMI, *TII);
         if (PacketHasLSU || CandLane != 0)
           continue;
       }
@@ -527,7 +610,8 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       int CandScore = scoreCandidate(*CandIt, CandClass,
                                      static_cast<unsigned>(CandLane),
                                      CandIt == MII, NumLaneChoices,
-                                     AdditionalFill);
+                                     AdditionalFill, PacketHasLSU, CandIsLSU,
+                                     MII, CandUses);
       if (BestIt != MBB.end() && CandScore <= BestScore)
         continue;
 
