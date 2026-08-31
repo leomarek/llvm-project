@@ -159,6 +159,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVLoadStoreOptPass(*PR);
   initializeStarbugVLIWPacketizerPass(*PR);
   initializeStarbugVLIWTraceSchedulerPass(*PR);
+  initializeStarbugVLIWBundleLayoutPass(*PR);
   initializeRISCVPreAllocZilsdOptPass(*PR);
   initializeRISCVExpandAtomicPseudoPass(*PR);
   initializeRISCVRedundantCopyEliminationPass(*PR);
@@ -619,6 +620,11 @@ void RISCVPassConfig::addPreEmitPass2() {
 
   if (EnableCFIInstrInserter)
     addPass(createCFIInstrInserter());
+
+  // Last: instruction sizes are final here, so this is the first point at
+  // which the byte offset of a bundle -- and therefore whether the fetch unit
+  // will accept it -- can be known.
+  addPass(createStarbugVLIWBundleLayoutPass());
 }
 
 void RISCVPassConfig::addMachineSSAOptimization() {
