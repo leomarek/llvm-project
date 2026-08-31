@@ -9,8 +9,11 @@
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Target/TargetMachine.h"
 #include <algorithm>
 #include <limits>
@@ -20,6 +23,10 @@ using namespace llvm;
 
 #define DEBUG_TYPE "starbug-vliw-packetizer"
 #define STARBUG_VLIW_PACKETIZER_NAME "Starbug VLIW Packetizer"
+
+STATISTIC(NumPacketsEmitted, "Number of STARBUG bundle hints emitted");
+STATISTIC(NumPacketsRejected,
+          "Number of candidate packets rejected by the safety verifier");
 
 namespace {
 
@@ -38,6 +45,20 @@ static bool isPacketizableMI(const MachineInstr &MI) {
     return false;
 
   return true;
+}
+
+// Debug instructions carry no semantics and emit no bytes, so the packetizer
+// has to step over them rather than react to them: building with -g must not
+// change code generation.
+//
+// They used to be caught by isPacketizableMI's meta-instruction filter, which
+// is also what the packetizer uses as its barrier test -- so every DBG_VALUE
+// flushed the packet in flight. On a -gdwarf-2 build of the CMSIS DSP kernels
+// (which is what the benchmark Makefiles use) that cost roughly three quarters
+// of all bundling, and it cost it only on the compiler side: hand-written
+// assembly carries its hints literally and never noticed.
+static bool isTransparentMI(const MachineInstr &MI, bool Enabled = true) {
+  return Enabled && MI.isDebugInstr();
 }
 
 static bool hasPCRelocationOperand(const MachineInstr &MI) {
@@ -86,25 +107,111 @@ static void collectRegAccesses(const MachineInstr &MI, DenseSet<Register> &Uses,
   }
 }
 
-static bool hasPacketDependency(const DenseSet<Register> &MIUses,
-                                const DenseSet<Register> &MIDefs,
-                                const DenseSet<Register> &PacketUses,
-                                const DenseSet<Register> &PacketDefs) {
+static bool overlapsAnyRegister(Register Reg, const DenseSet<Register> &Regs,
+                                const TargetRegisterInfo &TRI) {
+  for (Register Other : Regs) {
+    if (TRI.regsOverlap(Reg, Other))
+      return true;
+  }
+  return false;
+}
+
+// RAW or WAW between a candidate and the packet built so far. Both make
+// parallel issue impossible: all lanes read the register file in one cycle and
+// write it back in one cycle, so a RAW consumer sees the stale value and a WAW
+// pair has no defined winner.
+static bool hasPacketHazard(const DenseSet<Register> &MIUses,
+                            const DenseSet<Register> &MIDefs,
+                            const DenseSet<Register> &PacketUses,
+                            const DenseSet<Register> &PacketDefs,
+                            const TargetRegisterInfo &TRI) {
+  (void)PacketUses;
   // RAW: current instruction reads what packet writes.
   for (Register Reg : MIUses)
-    if (PacketDefs.contains(Reg))
+    if (overlapsAnyRegister(Reg, PacketDefs, TRI))
       return true;
 
-  // WAW/WAR: concurrent writes or write-after-read in one packet.
+  // WAW: two lanes writing one register in one cycle.
   for (Register Reg : MIDefs)
-    if (PacketDefs.contains(Reg) || PacketUses.contains(Reg))
+    if (overlapsAnyRegister(Reg, PacketDefs, TRI))
       return true;
 
   return false;
 }
 
+// WAR: the candidate overwrites something an existing packet member reads.
+// Harmless for *parallel* issue -- every lane reads before any lane writes back
+// -- but fatal the moment the emitted order changes, because the fetch unit can
+// decline the bundle and run the same bytes sequentially. Kept separate so the
+// packetizer can accept it exactly when it is not going to reorder.
+static bool hasPacketAntiDependence(const DenseSet<Register> &MIDefs,
+                                    const DenseSet<Register> &PacketUses,
+                                    const TargetRegisterInfo &TRI) {
+  for (Register Reg : MIDefs)
+    if (overlapsAnyRegister(Reg, PacketUses, TRI))
+      return true;
+  return false;
+}
+
+static bool hasPacketDependency(const DenseSet<Register> &MIUses,
+                                const DenseSet<Register> &MIDefs,
+                                const DenseSet<Register> &PacketUses,
+                                const DenseSet<Register> &PacketDefs,
+                                const TargetRegisterInfo &TRI) {
+  return hasPacketHazard(MIUses, MIDefs, PacketUses, PacketDefs, TRI) ||
+         hasPacketAntiDependence(MIDefs, PacketUses, TRI);
+}
+
+// Does this instruction read or write the f-register file?
+//
+// This runs post-RA, so every register operand is already physical and its
+// register class answers the question directly. Testing the register file is
+// better than enumerating opcodes here: it covers F, D and Zfh in one rule and
+// it cannot silently miss an instruction the way an opcode list can.
+static bool touchesFPRegisters(const MachineInstr &MI) {
+  for (const MachineOperand &MO : MI.operands()) {
+    if (!MO.isReg())
+      continue;
+    Register Reg = MO.getReg();
+    if (!Reg || !Reg.isPhysical())
+      continue;
+    if (RISCV::FPR32RegClass.contains(Reg) ||
+        RISCV::FPR64RegClass.contains(Reg) ||
+        RISCV::FPR16RegClass.contains(Reg))
+      return true;
+  }
+  return false;
+}
+
+// fdiv and fsqrt drive FDivBusyE, which wallypipelinedcore.sv ORs across the
+// lanes into a core-wide execute stall (hazard.sv:87). They are still legal in
+// a worker lane -- they are just not free, so they get their own class and can
+// be excluded from worker lanes with -starbug-vliw-lane-op-classes for sweeps.
+static bool isFPDivSqrtOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case RISCV::FDIV_S:  case RISCV::FDIV_D:  case RISCV::FDIV_H:
+  case RISCV::FSQRT_S: case RISCV::FSQRT_D: case RISCV::FSQRT_H:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Classify by opcode, not by substring of the instruction's name.
+//
+// The previous name-matching version misfiled a lot of common code: XOR, OR,
+// AND and SLT matched no pattern at all and fell through to OpClass::Any,
+// which is lane-0 only, so any kernel built from logic ops was pinned to a
+// single lane. "SH" also matched store-halfword, and "ADD" matched AMOADD.
+// Anything genuinely unrecognised still lands on Any and stays in lane 0,
+// which is the safe direction.
 static OpClass classifyOpClass(const MachineInstr &MI,
-                               const RISCVInstrInfo &TII) {
+                               const RISCVInstrInfo &TII,
+                               bool PacketizeFP) {
+  (void)TII; // classification is now opcode-driven; no name lookup needed
+
+  // These predicates come from the instruction description and outrank any
+  // opcode guess.
   if (MI.isBranch() || MI.isTerminator() || MI.isCall() || MI.isReturn())
     return OpClass::Branch;
   if (MI.mayLoad())
@@ -112,27 +219,59 @@ static OpClass classifyOpClass(const MachineInstr &MI,
   if (MI.mayStore())
     return OpClass::Store;
 
-  StringRef Name = TII.getName(MI.getOpcode());
-  if (Name.contains("LW") || Name.contains("LD") || Name.contains("LOAD"))
-    return OpClass::Load;
-  if (Name.contains("SW") || Name.contains("SD") || Name.contains("STORE"))
-    return OpClass::Store;
-  if (Name.contains("ADD") || Name.contains("SUB"))
+  // Floating point belongs in the worker lanes. wallypipelinedcore.sv
+  // instantiates fpu_1/fpu_2/fpu_3 beside the lane IEUs, backs them with
+  // fregfile_widened (four write ports), and routes each lane's FP-to-integer
+  // results -- FIntResM_n, FCvtIntResW_n, FIntDivResultW_n -- back into that
+  // lane's own IEU writeback, so fmv.x.w and fcvt.w.s are as legal as fadd.s.
+  // FP loads and stores are not covered here: mayLoad/mayStore above already
+  // claimed them for lane 0 along with the rest of the memory traffic.
+  if (touchesFPRegisters(MI))
+    return !PacketizeFP ? OpClass::Any
+                        : (isFPDivSqrtOpcode(MI.getOpcode())
+                               ? OpClass::FPUDivSqrt
+                               : OpClass::FPU);
+
+  switch (MI.getOpcode()) {
+  case RISCV::ADD:  case RISCV::ADDI:  case RISCV::SUB:
+  case RISCV::ADDW: case RISCV::ADDIW: case RISCV::SUBW:
+  case RISCV::C_ADD: case RISCV::C_ADDI: case RISCV::C_ADDI16SP:
+  case RISCV::C_ADDI4SPN: case RISCV::C_SUB:
+  case RISCV::C_ADDW: case RISCV::C_SUBW:
     return OpClass::ALUAddSub;
-  if (Name.contains("MUL") || Name.contains("DIV") || Name.contains("REM"))
+
+  case RISCV::MUL:  case RISCV::MULH: case RISCV::MULHU: case RISCV::MULHSU:
+  case RISCV::MULW:
+  case RISCV::DIV:  case RISCV::DIVU: case RISCV::DIVW:  case RISCV::DIVUW:
+  case RISCV::REM:  case RISCV::REMU: case RISCV::REMW:  case RISCV::REMUW:
     return OpClass::ALUMulDiv;
-  if (Name.contains("SLL") || Name.contains("SRL") || Name.contains("SRA") ||
-      Name.contains("ROL") || Name.contains("ROR") || Name.contains("SH"))
+
+  case RISCV::SLL:  case RISCV::SLLI: case RISCV::SRL: case RISCV::SRLI:
+  case RISCV::SRA:  case RISCV::SRAI:
+  case RISCV::SLLW: case RISCV::SLLIW: case RISCV::SRLW: case RISCV::SRLIW:
+  case RISCV::SRAW: case RISCV::SRAIW:
+  case RISCV::C_SLLI: case RISCV::C_SRLI: case RISCV::C_SRAI:
     return OpClass::ALUShift;
-  if (Name.contains("CSR"))
-    return OpClass::CSR;
-  if (Name.contains("MV") || Name.contains("LI") || Name.contains("COPY"))
-    return OpClass::Move;
-  if (Name.contains("SLT") || Name.contains("SEQ") || Name.contains("SNE") ||
-      Name.contains("SGE") || Name.contains("SGT"))
+
+  case RISCV::XOR: case RISCV::XORI: case RISCV::OR: case RISCV::ORI:
+  case RISCV::AND: case RISCV::ANDI:
+  case RISCV::C_XOR: case RISCV::C_OR: case RISCV::C_AND: case RISCV::C_ANDI:
+    return OpClass::ALULogic;
+
+  case RISCV::SLT: case RISCV::SLTI: case RISCV::SLTU: case RISCV::SLTIU:
     return OpClass::Compare;
 
-  return OpClass::Any;
+  case RISCV::LUI: case RISCV::C_LUI: case RISCV::C_LI: case RISCV::C_MV:
+  case TargetOpcode::COPY:
+    return OpClass::Move;
+
+  case RISCV::CSRRW: case RISCV::CSRRS: case RISCV::CSRRC:
+  case RISCV::CSRRWI: case RISCV::CSRRSI: case RISCV::CSRRCI:
+    return OpClass::CSR;
+
+  default:
+    return OpClass::Any;
+  }
 }
 
 static Register getMemoryBaseReg(const MachineInstr &MI) {
@@ -147,12 +286,13 @@ static Register getMemoryBaseReg(const MachineInstr &MI) {
   return Register();
 }
 
+// Does this instruction occupy the single shared LSU? mayLoad/mayStore come
+// from the instruction description and are authoritative; the old substring
+// fallback additionally caught unrelated opcodes whose names merely contained
+// "LD" or "SW" and needlessly kept them out of worker lanes.
 static bool isLikelyLSUOp(const MachineInstr &MI, const RISCVInstrInfo &TII) {
-  if (MI.mayLoad() || MI.mayStore())
-    return true;
-  StringRef Name = TII.getName(MI.getOpcode());
-  return Name.contains("LW") || Name.contains("LD") || Name.contains("LOAD") ||
-         Name.contains("SW") || Name.contains("SD") || Name.contains("STORE");
+  (void)TII;
+  return MI.mayLoad() || MI.mayStore();
 }
 
 static bool mayReorderAcross(const MachineInstr &A, const MachineInstr &B,
@@ -173,10 +313,28 @@ static bool mayReorderAcross(const MachineInstr &A, const MachineInstr &B,
   return true;
 }
 
+static bool hasMemoryBaseDefHazard(const MachineInstr &MemMI,
+                                   const MachineInstr &OtherMI,
+                                   const TargetRegisterInfo &TRI) {
+  if (!MemMI.mayLoad() && !MemMI.mayStore())
+    return false;
+
+  Register Base = getMemoryBaseReg(MemMI);
+  if (!Base)
+    return false;
+
+  DenseSet<Register> OtherUses;
+  DenseSet<Register> OtherDefs;
+  collectRegAccesses(OtherMI, OtherUses, OtherDefs);
+  return overlapsAnyRegister(Base, OtherDefs, TRI);
+}
+
 static bool canHoistCandidate(MachineBasicBlock::iterator InsertPos,
                               MachineBasicBlock::iterator CandIt,
                               bool PacketizePCRelative,
-                              bool AssumeNoMemoryAlias) {
+                              bool AssumeNoMemoryAlias,
+                              bool DebugTransparent,
+                              const TargetRegisterInfo &TRI) {
   if (InsertPos == CandIt)
     return true;
 
@@ -187,6 +345,8 @@ static bool canHoistCandidate(MachineBasicBlock::iterator InsertPos,
 
   for (auto It = InsertPos; It != CandIt; ++It) {
     const MachineInstr &Intervening = *It;
+    if (isTransparentMI(Intervening, DebugTransparent))
+      continue;
     if ((!PacketizePCRelative && isPCRelativeSetupMI(Intervening)) ||
         !isPacketizableMI(Intervening))
       return false;
@@ -195,12 +355,126 @@ static bool canHoistCandidate(MachineBasicBlock::iterator InsertPos,
     DenseSet<Register> IDefs;
     collectRegAccesses(Intervening, IUses, IDefs);
 
-    if (hasPacketDependency(CandUses, CandDefs, IUses, IDefs) ||
-        hasPacketDependency(IUses, IDefs, CandUses, CandDefs))
+    if (hasPacketDependency(CandUses, CandDefs, IUses, IDefs, TRI) ||
+        hasPacketDependency(IUses, IDefs, CandUses, CandDefs, TRI))
+      return false;
+
+    if (hasMemoryBaseDefHazard(Cand, Intervening, TRI) ||
+        hasMemoryBaseDefHazard(Intervening, Cand, TRI))
       return false;
 
     if (!mayReorderAcross(Cand, Intervening, AssumeNoMemoryAlias))
       return false;
+  }
+
+  return true;
+}
+
+// Instructions that only lane 0 can execute. Worker lanes have their LSU
+// address path (IEUAdrE) and branch path (PCSrcE) disconnected in the STARBUG
+// RTL, and their MemRW outputs are not wired to the LSU at all -- a memory op
+// placed in a worker lane is silently dropped rather than faulting. Anything
+// reading the PC is also lane-0 only because every lane is fed the same PCE.
+static bool isLane0OnlyMI(const MachineInstr &MI) {
+  return MI.mayLoad() || MI.mayStore() || MI.isBranch() || MI.isCall() ||
+         MI.isReturn() || MI.isTerminator() || MI.isBarrier() ||
+         MI.hasUnmodeledSideEffects() || isPCRelativeSetupMI(MI);
+}
+
+/// Are these instructions independent enough to be freely permuted?
+///
+/// The packetizer reorders packet members so that lane assignment matches
+/// emission order. That permutation has to be correct under *sequential*
+/// execution as well as parallel, because the fetch unit silently declines a
+/// bundle whenever it straddles an I-cache line, is uncacheable, or comes from
+/// the IROM -- and then runs the very same bytes scalar, in memory order. The
+/// whole ISA-compatibility story rests on that fallback being correct.
+///
+/// So permutation requires full independence: RAW and WAW (which parallel
+/// issue also requires) plus WAR (which only matters once the order changes).
+static bool arePacketMembersIndependent(ArrayRef<MachineInstr *> Members,
+                                        const TargetRegisterInfo &TRI) {
+  for (unsigned I = 0; I < Members.size(); ++I) {
+    DenseSet<Register> IUses, IDefs;
+    collectRegAccesses(*Members[I], IUses, IDefs);
+    for (unsigned J = I + 1; J < Members.size(); ++J) {
+      DenseSet<Register> JUses, JDefs;
+      collectRegAccesses(*Members[J], JUses, JDefs);
+      if (hasPacketDependency(JUses, JDefs, IUses, IDefs, TRI))
+        return false;
+    }
+  }
+  return true;
+}
+
+/// Final safety gate for a formed packet.
+///
+/// STARBUG hardware trusts the HINT unconditionally: there is no interlock
+/// that detects a bundle whose members are actually dependent, so a bad hint
+/// is a silent wrong answer rather than a fault. This re-derives the facts
+/// from the *final* instruction sequence that will be emitted, independently
+/// of the scheduling heuristics that produced it. If anything fails we simply
+/// decline to emit the hint; the same instructions then execute scalar, which
+/// is always correct.
+static bool isPacketSafeToHint(MachineBasicBlock &MBB, MachineInstr &First,
+                               unsigned PacketSize, bool DebugTransparent,
+                               const TargetRegisterInfo &TRI) {
+  if (PacketSize == 0)
+    return false;
+
+  // Collect the instructions that will actually follow the hint, in program
+  // order, rather than trusting the packet bookkeeping.
+  SmallVector<MachineInstr *, 8> Members;
+  auto It = First.getIterator();
+  for (unsigned I = 0; I < PacketSize; ++I) {
+    // Debug instructions emit nothing, so they do not sit between the hint and
+    // its members in the encoded stream and must not be counted here.
+    while (It != MBB.end() && isTransparentMI(*It, DebugTransparent))
+      ++It;
+    if (It == MBB.end())
+      return false;
+    // Anything else that is not a real, packetizable instruction breaks the
+    // "next N instructions" contract the hint encodes.
+    if (!isPacketizableMI(*It))
+      return false;
+    Members.push_back(&*It);
+    ++It;
+  }
+
+  unsigned MemoryOps = 0;
+  for (unsigned I = 0; I < Members.size(); ++I) {
+    const MachineInstr &MI = *Members[I];
+    const bool IsMem = MI.mayLoad() || MI.mayStore();
+    if (IsMem) {
+      ++MemoryOps;
+      // The single LSU is wired to lane 0.
+      if (I != 0)
+        return false;
+    }
+    if (I != 0 && isLane0OnlyMI(MI))
+      return false;
+  }
+  if (MemoryOps > 1)
+    return false;
+
+  // Every lane reads the register file in the same cycle and writes back in
+  // the same cycle, so a RAW pair can never be satisfied and a WAW pair has no
+  // defined winner. Both must be absent. (WAR is architecturally safe here and
+  // is deliberately permitted.)
+  for (unsigned I = 0; I < Members.size(); ++I) {
+    DenseSet<Register> IUses, IDefs;
+    collectRegAccesses(*Members[I], IUses, IDefs);
+    for (unsigned J = I + 1; J < Members.size(); ++J) {
+      DenseSet<Register> JUses, JDefs;
+      collectRegAccesses(*Members[J], JUses, JDefs);
+
+      for (Register Reg : JUses)               // RAW: J reads what I writes
+        if (overlapsAnyRegister(Reg, IDefs, TRI))
+          return false;
+      for (Register Reg : JDefs)               // WAW: both write
+        if (overlapsAnyRegister(Reg, IDefs, TRI))
+          return false;
+    }
   }
 
   return true;
@@ -240,8 +514,9 @@ bool StarbugVLIWPacketizer::runOnMachineFunction(MachineFunction &MF) {
 bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
                                                 const RISCVSubtarget &ST) {
   const auto *TII = ST.getInstrInfo();
+  const auto *TRI = ST.getRegisterInfo();
   bool Changed = false;
-  if (!TII)
+  if (!TII || !TRI)
     return false;
 
   SmallVector<MachineInstr *, 8> Packet;
@@ -249,7 +524,16 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
   DenseSet<Register> PacketUses;
   DenseSet<Register> PacketDefs;
 
+  // WAR is safe inside a bundle but not across a reordering (see
+  // hasPacketAntiDependence). These two flags are what let the packetizer keep
+  // an anti-dependent member: it accepts one only while the packet is still
+  // exactly the original instruction sequence, and then refuses to permute.
+  bool PacketInProgramOrder = true;
+  bool PacketHasAntiDep = false;
+
   auto isBarrier = [&](const MachineInstr &MI) {
+    if (isTransparentMI(MI, Config.Scheduler.DebugInstrsTransparent))
+      return false;
     if (!Config.Scheduler.PacketizePCRelative && isPCRelativeSetupMI(MI))
       return true;
     return !isPacketizableMI(MI);
@@ -325,27 +609,100 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     return DefReg && UseReg && DefReg == UseReg && HasImm && Imm != 0;
   };
 
+  auto abandonPacket = [&]() {
+    Packet.clear();
+    PacketLanes.clear();
+    PacketUses.clear();
+    PacketDefs.clear();
+    PacketInProgramOrder = true;
+    PacketHasAntiDep = false;
+  };
+
   auto flushPacket = [&]() {
     if (Packet.empty())
       return;
 
-    // The emitted instruction order after STARBUG_BUNDLE_HINT defines lane
-    // slots in hardware. Reorder packet members by chosen lane so lane 0 op
-    // is emitted first, lane 1 second, etc.
-    SmallVector<unsigned, 8> PacketOrder(Packet.size());
-    std::iota(PacketOrder.begin(), PacketOrder.end(), 0);
-    llvm::stable_sort(PacketOrder, [&](unsigned LHS, unsigned RHS) {
-      return PacketLanes[LHS] < PacketLanes[RHS];
-    });
+    // Check before touching the block, not after. If the members are not
+    // mutually independent we must not permute them at all: the reordered
+    // sequence would still be what executes when the fetch unit declines the
+    // bundle. Leaving them in program order and emitting no hint costs
+    // parallelism and nothing else.
+    // A packet carrying an anti-dependence is deliberately exempt: it was only
+    // allowed to form while it stayed in original program order, and the
+    // ordering step below refuses to move anything in it. Everything else is
+    // free to be permuted and must prove it.
+    if (Packet.size() > 1 && !PacketHasAntiDep &&
+        !arePacketMembersIndependent(Packet, *TRI)) {
+      ++NumPacketsRejected;
+      LLVM_DEBUG(dbgs() << "starbug: abandoning non-independent packet of size "
+                        << Packet.size() << " in " << MBB.getName() << '\n');
+      abandonPacket();
+      return;
+    }
 
+    // Hardware assigns lanes by *position*: the instruction right after the
+    // hint is lane 0, the next is lane 1, and so on, with no gaps possible.
+    // The lane numbers chosen during packet building are only a reservation
+    // scheme, and sorting by them used to leave lane 0 empty whenever every
+    // member happened to be worker-legal -- which then failed the dense-prefix
+    // test and threw the whole bundle away.
+    //
+    // Build the emission order directly instead: the one member that must own
+    // lane 0 (a memory op, or anything else worker lanes cannot execute) goes
+    // first, and the rest follow in program order. Positions are dense by
+    // construction.
+    SmallVector<unsigned, 8> PacketOrder;
+    PacketOrder.reserve(Packet.size());
+    int MustBeFirst = -1;
+    for (unsigned I = 0; I < Packet.size(); ++I) {
+      if (!isLikelyLSUOp(*Packet[I], *TII) && !isLane0OnlyMI(*Packet[I]))
+        continue;
+      if (MustBeFirst >= 0) {
+        // Two members both need lane 0; no legal placement exists. Leave them
+        // untouched and emit nothing.
+        ++NumPacketsRejected;
+        abandonPacket();
+        return;
+      }
+      MustBeFirst = static_cast<int>(I);
+    }
+    // The one permutation this routine can still perform is hoisting the
+    // lane-0-only member to the front. With an anti-dependence present that is
+    // exactly the move that would break the scalar-fallback reading of these
+    // bytes, so give the bundle up instead.
+    if (MustBeFirst > 0 && PacketHasAntiDep) {
+      ++NumPacketsRejected;
+      LLVM_DEBUG(dbgs() << "starbug: anti-dependent packet needs a lane-0 "
+                           "hoist; leaving it scalar in "
+                        << MBB.getName() << '\n');
+      abandonPacket();
+      return;
+    }
+
+    if (MustBeFirst >= 0)
+      PacketOrder.push_back(static_cast<unsigned>(MustBeFirst));
+    for (unsigned I = 0; I < Packet.size(); ++I)
+      if (static_cast<int>(I) != MustBeFirst)
+        PacketOrder.push_back(I);
+
+    // Rebuild the region in lane order. InsertPos stays anchored on the first
+    // not-yet-placed instruction: splicing a member in front of it fills the
+    // slot immediately before InsertPos, so InsertPos must only advance when
+    // the instruction already sitting there is the one we wanted next.
+    // (Advancing after a splice would step over an unplaced instruction and
+    // silently drop it into, or out of, the bundle.)
     auto InsertPos = Packet.front()->getIterator();
     for (unsigned Idx : PacketOrder) {
       MachineInstr *MI = Packet[Idx];
-      if (MI->getIterator() != InsertPos) {
-        MBB.splice(InsertPos, &MBB, MI->getIterator());
-        Changed = true;
+      while (InsertPos != MBB.end() &&
+             isTransparentMI(*InsertPos, Config.Scheduler.DebugInstrsTransparent))
+        ++InsertPos;
+      if (&*InsertPos == MI) {
+        ++InsertPos;
+        continue;
       }
-      ++InsertPos;
+      MBB.splice(InsertPos, &MBB, MI->getIterator());
+      Changed = true;
     }
 
     SmallVector<MachineInstr *, 8> SortedPacket;
@@ -362,47 +719,40 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     const size_t PacketSize = Packet.size();
     const bool IsSingle = PacketSize == 1;
     const bool IsFull = PacketSize == Config.maxBundleWidth();
-    bool HasDenseLanePrefix = true;
-    for (unsigned Lane = 0; Lane < PacketLanes.size(); ++Lane) {
-      if (PacketLanes[Lane] != Lane) {
-        HasDenseLanePrefix = false;
-        break;
-      }
-    }
-    unsigned MemoryOps = 0;
-    int FirstMemoryIndex = -1;
-    for (unsigned I = 0; I < Packet.size(); ++I) {
-      if (!isLikelyLSUOp(*Packet[I], *TII))
-        continue;
-      ++MemoryOps;
-      if (FirstMemoryIndex < 0)
-        FirstMemoryIndex = static_cast<int>(I);
-    }
-    const bool IsLSULegalPacket =
-        MemoryOps <= 1 && (FirstMemoryIndex < 0 || FirstMemoryIndex == 0);
 
+    // Positions are dense by construction now, and the ordering step above
+    // already guaranteed at most one lane-0-only member sitting at index 0.
+    // isPacketSafeToHint re-derives both facts from the emitted sequence
+    // below, so this only decides whether a bundle of this *size* is worth a
+    // hint at all.
     bool ShouldEmitHint = false;
-    if (!HasDenseLanePrefix || !IsLSULegalPacket)
-      ShouldEmitHint = false;
-    else if (IsFull)
+    if (IsFull)
       ShouldEmitHint = true;
     else if (!IsSingle && Config.Scheduler.AllowShortPackets)
       ShouldEmitHint = true;
     else if (IsSingle && Config.Scheduler.EmitSingleInstructionHints)
       ShouldEmitHint = true;
 
-    if (ShouldEmitHint) {
+    // A hint is only ever a performance hint: declining to emit one costs
+    // parallelism but never correctness. Verify the real emitted sequence and
+    // stay scalar if it does not check out.
+    if (ShouldEmitHint && PacketSize <= Config.maxBundleWidth()) {
       MachineInstr &First = *Packet.front();
-      BuildMI(MBB, First, First.getDebugLoc(),
-              TII->get(RISCV::STARBUG_BUNDLE_HINT))
-          .addImm(static_cast<int64_t>(PacketSize));
-      Changed = true;
+      if (isPacketSafeToHint(MBB, First, PacketSize,
+                             Config.Scheduler.DebugInstrsTransparent, *TRI)) {
+        BuildMI(MBB, First, First.getDebugLoc(),
+                TII->get(RISCV::STARBUG_BUNDLE_HINT))
+            .addImm(static_cast<int64_t>(PacketSize));
+        ++NumPacketsEmitted;
+        Changed = true;
+      } else {
+        ++NumPacketsRejected;
+        LLVM_DEBUG(dbgs() << "starbug: rejected unsafe packet of size "
+                          << PacketSize << " in " << MBB.getName() << '\n');
+      }
     }
 
-    Packet.clear();
-    PacketLanes.clear();
-    PacketUses.clear();
-    PacketDefs.clear();
+    abandonPacket();
   };
 
   auto estimateAdditionalFill = [&](MachineBasicBlock::iterator InsertPos,
@@ -432,22 +782,38 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     for (auto It = InsertPos; It != MBB.end() && Seen < LookAhead; ++It) {
       if (isBarrier(*It))
         break;
+      if (isTransparentMI(*It, Config.Scheduler.DebugInstrsTransparent))
+        continue;
       ++Seen;
       if (It == ChosenIt)
         continue;
 
-      if (!canHoistCandidate(InsertPos, It, Config.Scheduler.PacketizePCRelative,
-                             Config.Scheduler.AssumeNoMemoryAlias))
+      if (!canHoistCandidate(InsertPos, It,
+                             Config.Scheduler.PacketizePCRelative,
+                             Config.Scheduler.AssumeNoMemoryAlias,
+                             Config.Scheduler.DebugInstrsTransparent, *TRI))
         continue;
 
       DenseSet<Register> CandUses;
       DenseSet<Register> CandDefs;
       collectRegAccesses(*It, CandUses, CandDefs);
 
-      if (hasPacketDependency(CandUses, CandDefs, SimUses, SimDefs))
+      if (hasPacketDependency(CandUses, CandDefs, SimUses, SimDefs, *TRI))
         continue;
 
-      const OpClass CandClass = classifyOpClass(*It, *TII);
+      bool BaseHazard = false;
+      for (MachineInstr *PMI : Packet) {
+        if (hasMemoryBaseDefHazard(*PMI, *It, *TRI) ||
+            hasMemoryBaseDefHazard(*It, *PMI, *TRI)) {
+          BaseHazard = true;
+          break;
+        }
+      }
+      if (BaseHazard)
+        continue;
+
+      const OpClass CandClass =
+          classifyOpClass(*It, *TII, Config.Scheduler.PacketizeFP);
       const int CandLane = tryAssignLaneWithUsed(CandClass, SimLanes);
       if (CandLane < 0)
         continue;
@@ -477,6 +843,8 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       --It;
       if (isBarrier(*It))
         break;
+      if (isTransparentMI(*It, Config.Scheduler.DebugInstrsTransparent))
+        continue;
 
       DenseSet<Register> PrevUses;
       DenseSet<Register> PrevDefs;
@@ -484,7 +852,8 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       ++Seen;
       if (PrevDefs.empty())
         continue;
-      if (classifyOpClass(*It, *TII) != ProducerClass)
+      if (classifyOpClass(*It, *TII, Config.Scheduler.PacketizeFP) !=
+          ProducerClass)
         continue;
       for (Register Reg : PrevDefs) {
         if (CandUses.contains(Reg))
@@ -558,6 +927,12 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
   };
 
   for (auto MII = MBB.begin(); MII != MBB.end();) {
+    if (isTransparentMI(*MII, Config.Scheduler.DebugInstrsTransparent)) {
+      // Emits no bytes: step over it and leave the packet in flight. Members
+      // separated by one of these are still contiguous once encoded.
+      ++MII;
+      continue;
+    }
     if (isBarrier(*MII)) {
       flushPacket();
       ++MII;
@@ -568,6 +943,7 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     DenseSet<Register> BestUses;
     DenseSet<Register> BestDefs;
     OpClass BestClass = OpClass::Any;
+    bool BestAntiDep = false;
     int BestScore = std::numeric_limits<int>::min();
     const bool PacketHasLSU =
         llvm::any_of(Packet, [&](const MachineInstr *PMI) {
@@ -579,21 +955,49 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     for (auto CandIt = MII; CandIt != MBB.end() && Seen < LookAhead; ++CandIt) {
       if (isBarrier(*CandIt))
         break;
+      if (isTransparentMI(*CandIt, Config.Scheduler.DebugInstrsTransparent))
+        continue;
       ++Seen;
 
-      if (!canHoistCandidate(MII, CandIt, Config.Scheduler.PacketizePCRelative,
-                             Config.Scheduler.AssumeNoMemoryAlias))
+      if (!canHoistCandidate(MII, CandIt,
+                             Config.Scheduler.PacketizePCRelative,
+                             Config.Scheduler.AssumeNoMemoryAlias,
+                             Config.Scheduler.DebugInstrsTransparent, *TRI))
         continue;
 
       DenseSet<Register> CandUses;
       DenseSet<Register> CandDefs;
       collectRegAccesses(*CandIt, CandUses, CandDefs);
 
-      if (!Packet.empty() &&
-          hasPacketDependency(CandUses, CandDefs, PacketUses, PacketDefs))
+      bool CandAntiDep = false;
+      if (!Packet.empty()) {
+        if (hasPacketHazard(CandUses, CandDefs, PacketUses, PacketDefs, *TRI))
+          continue;
+        CandAntiDep = hasPacketAntiDependence(CandDefs, PacketUses, *TRI);
+        // An anti-dependent member may join only if taking it changes nothing
+        // about the order: it has to be at the head already, and every earlier
+        // member has to have come from the head too. Then the bundle's bytes
+        // are still the original program, which is what executes if the fetch
+        // unit declines the bundle or a branch lands in the middle of it.
+        if (CandAntiDep &&
+            !(Config.Scheduler.AllowIntraPacketWAR && PacketInProgramOrder &&
+              CandIt == MII))
+          continue;
+      }
+
+      bool BaseHazard = false;
+      for (MachineInstr *PMI : Packet) {
+        if (hasMemoryBaseDefHazard(*PMI, *CandIt, *TRI) ||
+            hasMemoryBaseDefHazard(*CandIt, *PMI, *TRI)) {
+          BaseHazard = true;
+          break;
+        }
+      }
+      if (BaseHazard)
         continue;
 
-      OpClass CandClass = classifyOpClass(*CandIt, *TII);
+      OpClass CandClass =
+          classifyOpClass(*CandIt, *TII, Config.Scheduler.PacketizeFP);
       int CandLane = tryAssignLane(CandClass);
       if (CandLane < 0)
         continue;
@@ -619,6 +1023,7 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       BestUses = std::move(CandUses);
       BestDefs = std::move(CandDefs);
       BestClass = CandClass;
+      BestAntiDep = CandAntiDep;
       BestScore = CandScore;
     }
 
@@ -630,12 +1035,26 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       continue;
     }
 
+    // Invariant: every packet member sits contiguously immediately before MII.
+    //
+    // MBB.splice(MII, ...) inserts the candidate *before* the instruction MII
+    // denotes, and leaves MII pointing at that same (still unscheduled)
+    // instruction. So the instruction we just scheduled is std::prev(MII), and
+    // MII must not advance -- it still refers to work we have not looked at.
+    // Only when the winning candidate was already at the head do we consume it
+    // and step forward.
+    MachineBasicBlock::iterator ScheduledIt;
     if (BestIt != MII) {
       MBB.splice(MII, &MBB, BestIt);
       Changed = true;
+      ScheduledIt = std::prev(MII);
+      PacketInProgramOrder = false;
+    } else {
+      ScheduledIt = MII;
+      ++MII;
     }
 
-    MachineInstr &Scheduled = *MII;
+    MachineInstr &Scheduled = *ScheduledIt;
     int Lane = tryAssignLane(BestClass);
     if (Lane < 0) {
       flushPacket();
@@ -644,10 +1063,9 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
 
     Packet.push_back(&Scheduled);
     PacketLanes.push_back(static_cast<unsigned>(Lane));
+    PacketHasAntiDep |= BestAntiDep;
     PacketUses.insert(BestUses.begin(), BestUses.end());
     PacketDefs.insert(BestDefs.begin(), BestDefs.end());
-
-    ++MII;
 
     if (Packet.size() >= Config.maxBundleWidth())
       flushPacket();

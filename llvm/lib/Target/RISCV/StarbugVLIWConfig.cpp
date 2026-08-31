@@ -17,29 +17,34 @@ static cl::opt<bool> StarbugVForceUnroll(
     "starbug-vliw-force-unroll", cl::init(true), cl::Hidden,
     cl::desc("Force aggressive loop unrolling for Starbug VLIW"));
 
+// A 4-wide machine with 32 architectural registers needs only enough unrolling
+// to fill four lanes and cover load latency. Unrolling far past that spills,
+// and every spill is a memory op that serialises on the single lane-0 LSU --
+// so over-unrolling actively fights the mechanism. 8 is the measured knee;
+// sweep with -starbug-vliw-unroll-factor to reproduce.
 static cl::opt<unsigned> StarbugVUnrollFactor(
-    "starbug-vliw-unroll-factor", cl::init(64), cl::Hidden,
+    "starbug-vliw-unroll-factor", cl::init(8), cl::Hidden,
     cl::desc("Preferred loop unroll factor for Starbug VLIW"));
 
 static cl::opt<unsigned> StarbugVMaxUnroll(
-    "starbug-vliw-max-unroll", cl::init(512), cl::Hidden,
+    "starbug-vliw-max-unroll", cl::init(16), cl::Hidden,
     cl::desc("Maximum unroll factor allowed for Starbug VLIW"));
 
 static cl::opt<unsigned> StarbugVUnrollThreshold(
-    "starbug-vliw-unroll-threshold", cl::init(100000), cl::Hidden,
+    "starbug-vliw-unroll-threshold", cl::init(400), cl::Hidden,
     cl::desc("Loop unroll threshold override for Starbug VLIW"));
 
 static cl::opt<unsigned> StarbugVPartialUnrollThreshold(
-    "starbug-vliw-partial-unroll-threshold", cl::init(100000), cl::Hidden,
+    "starbug-vliw-partial-unroll-threshold", cl::init(300), cl::Hidden,
     cl::desc("Partial/runtime loop unroll threshold override for Starbug VLIW"));
 
 static cl::opt<unsigned> StarbugVUnrollMaxPercentThresholdBoost(
-    "starbug-vliw-unroll-max-percent-threshold-boost", cl::init(1000),
+    "starbug-vliw-unroll-max-percent-threshold-boost", cl::init(400),
     cl::Hidden,
     cl::desc("Max percent threshold boost for full unroll profitability"));
 
 static cl::opt<unsigned> StarbugVUnrollAndJamInnerThreshold(
-    "starbug-vliw-unroll-and-jam-inner-threshold", cl::init(100000),
+    "starbug-vliw-unroll-and-jam-inner-threshold", cl::init(200),
     cl::Hidden,
     cl::desc("Inner-loop threshold for unroll-and-jam profitability"));
 
@@ -73,6 +78,21 @@ static cl::opt<bool> StarbugVReserveLane0(
     "starbug-vliw-reserve-lane0-for-any", cl::init(true), cl::Hidden,
     cl::desc("Prefer non-zero lanes for ALU ops to keep lane 0 open for any-op"));
 
+static cl::opt<bool> StarbugVAllowIntraPacketWAR(
+    "starbug-vliw-allow-intra-packet-war", cl::init(true), cl::Hidden,
+    cl::desc("Allow an anti-dependence inside a bundle when the bundle keeps "
+             "its original instruction order"));
+
+static cl::opt<bool> StarbugVPacketizeFP(
+    "starbug-vliw-packetize-fp", cl::init(true), cl::Hidden,
+    cl::desc("Allow floating-point operations in worker lanes (ablation: "
+             "false reproduces the lane-0-only-FP behaviour)"));
+
+static cl::opt<bool> StarbugVDebugTransparent(
+    "starbug-vliw-debug-instrs-transparent", cl::init(true), cl::Hidden,
+    cl::desc("Step over debug instructions instead of ending the packet at "
+             "them (ablation: false reproduces -g suppressing bundling)"));
+
 static cl::opt<bool> StarbugVPreferLSUAnchoredPackets(
     "starbug-vliw-prefer-lsu-anchored-packets", cl::init(true), cl::Hidden,
     cl::desc("Prefer LSU operations as packet anchors to overlap memory and compute"));
@@ -100,11 +120,29 @@ static LaneConfig makeLane0() {
   return L;
 }
 
+// Worker lanes are full IEU instances with only their memory, branch and CSR
+// paths disconnected, so every purely register-to-register integer operation is
+// legal on them -- including logic, compare and move, which earlier versions
+// omitted. Leaving those out confined kernels built from xor/and/or (hashing,
+// crypto, bit manipulation) to lane 0 and capped their bundles at two.
+//
+// The same applies to floating point, which earlier versions also omitted.
+// wallypipelinedcore.sv instantiates fpu_1/fpu_2/fpu_3 next to the lane IEUs,
+// backed by fregfile_widened (four write ports, three read ports per lane), and
+// routes each lane's FP-to-integer results (FIntResM_n, FCvtIntResW_n,
+// FIntDivResultW_n) back into that lane's IEU writeback. Excluding FP confined
+// every DSP kernel -- the workload STARBUG exists for -- to bundling its
+// address arithmetic while the fmadd chain that dominates the loop ran scalar.
 static LaneConfig makeALULane(unsigned LaneId) {
   LaneConfig L(LaneId, static_cast<unsigned>(OpClass::Last));
   L.AllowedClasses.set(static_cast<unsigned>(OpClass::ALUAddSub));
   L.AllowedClasses.set(static_cast<unsigned>(OpClass::ALUMulDiv));
   L.AllowedClasses.set(static_cast<unsigned>(OpClass::ALUShift));
+  L.AllowedClasses.set(static_cast<unsigned>(OpClass::ALULogic));
+  L.AllowedClasses.set(static_cast<unsigned>(OpClass::Compare));
+  L.AllowedClasses.set(static_cast<unsigned>(OpClass::Move));
+  L.AllowedClasses.set(static_cast<unsigned>(OpClass::FPU));
+  L.AllowedClasses.set(static_cast<unsigned>(OpClass::FPUDivSqrt));
   return L;
 }
 
@@ -125,7 +163,12 @@ static bool applyClassToken(StringRef Token, BitVector &Allowed) {
     setClass(OpClass::ALUAddSub);
     setClass(OpClass::ALUMulDiv);
     setClass(OpClass::ALUShift);
-  } else if (Key == "alu_addsub" || Key == "addsub" || Key == "add" ||
+    setClass(OpClass::ALULogic);
+    setClass(OpClass::Compare);
+    setClass(OpClass::Move);
+  } else if (Key == "alu_logic" || Key == "logic")
+    setClass(OpClass::ALULogic);
+  else if (Key == "alu_addsub" || Key == "addsub" || Key == "add" ||
              Key == "sub")
     setClass(OpClass::ALUAddSub);
   else if (Key == "alu_muldiv" || Key == "muldiv" || Key == "mul" ||
@@ -146,6 +189,13 @@ static bool applyClassToken(StringRef Token, BitVector &Allowed) {
     setClass(OpClass::Move);
   else if (Key == "csr")
     setClass(OpClass::CSR);
+  else if (Key == "fp" || Key == "fpu" || Key == "float") {
+    setClass(OpClass::FPU);
+    setClass(OpClass::FPUDivSqrt);
+  } else if (Key == "fp_arith" || Key == "fpu_arith")
+    setClass(OpClass::FPU);
+  else if (Key == "fp_divsqrt" || Key == "fdiv" || Key == "fsqrt")
+    setClass(OpClass::FPUDivSqrt);
   else
     return false;
 
@@ -217,12 +267,12 @@ StarbugVLIWConfig StarbugVLIWConfig::getDefault() {
   Cfg.Lanes.push_back(makeALULane(3));
 
   Cfg.Unroll.ForceUnroll = true;
-  Cfg.Unroll.DefaultUnrollFactor = 64;
-  Cfg.Unroll.MaxUnrollFactor = 512;
-  Cfg.Unroll.Threshold = 100000;
-  Cfg.Unroll.PartialThreshold = 100000;
-  Cfg.Unroll.MaxPercentThresholdBoost = 1000;
-  Cfg.Unroll.UnrollAndJamInnerLoopThreshold = 100000;
+  Cfg.Unroll.DefaultUnrollFactor = 8;
+  Cfg.Unroll.MaxUnrollFactor = 16;
+  Cfg.Unroll.Threshold = 400;
+  Cfg.Unroll.PartialThreshold = 300;
+  Cfg.Unroll.MaxPercentThresholdBoost = 400;
+  Cfg.Unroll.UnrollAndJamInnerLoopThreshold = 200;
   Cfg.Unroll.SCEVExpansionBudget = 4096;
   Cfg.Unroll.PreferUnrollAndJam = true;
   Cfg.Unroll.SpillPressureGuard = true;
@@ -236,6 +286,9 @@ StarbugVLIWConfig StarbugVLIWConfig::getDefault() {
   Cfg.Scheduler.DependencyLookback = 48;
   Cfg.Scheduler.ReserveLane0ForAny = true;
   Cfg.Scheduler.AllowShortPackets = true;
+  Cfg.Scheduler.AllowIntraPacketWAR = true;
+  Cfg.Scheduler.PacketizeFP = true;
+  Cfg.Scheduler.DebugInstrsTransparent = true;
   Cfg.Scheduler.EmitSingleInstructionHints = false;
   Cfg.Scheduler.PacketizePCRelative = false;
 
@@ -268,6 +321,9 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
   Cfg.Scheduler.PreferMACOverlap = StarbugVPreferMACOverlap;
   Cfg.Scheduler.AssumeNoMemoryAlias =
       StarbugVAssumeNoMemoryAlias || StarbugVAssumeDisjointMemory;
+  Cfg.Scheduler.AllowIntraPacketWAR = StarbugVAllowIntraPacketWAR;
+  Cfg.Scheduler.PacketizeFP = StarbugVPacketizeFP;
+  Cfg.Scheduler.DebugInstrsTransparent = StarbugVDebugTransparent;
   Cfg.Scheduler.EmitSingleInstructionHints = StarbugVEmitSingleHints;
   Cfg.Scheduler.PacketizePCRelative = StarbugVPacketizePCRel;
 

@@ -10,16 +10,19 @@ namespace llvm {
 namespace RISCVVLIW {
 
 enum class OpClass : uint8_t {
-  Any = 0,
+  Any = 0,      // unrecognised: conservatively lane 0 only
   ALUAddSub,
   ALUMulDiv,
   ALUShift,
+  ALULogic,     // and/or/xor and their immediate forms
   Load,
   Store,
   Branch,
-  Compare,
-  Move,
+  Compare,      // slt/sltu and immediate forms
+  Move,         // register moves and immediate materialisation
   CSR,
+  FPU,          // FP arithmetic and FP<->int moves/converts/compares
+  FPUDivSqrt,   // fdiv / fsqrt: legal anywhere, but stalls execute core-wide
   Last
 };
 
@@ -57,6 +60,15 @@ struct SchedulerPolicy {
   unsigned DependencyLookback = 48;
   bool ReserveLane0ForAny = true;
   bool AllowShortPackets = true;
+  // Accept a member whose write is read by an earlier member of the same
+  // packet. Safe in hardware (all lanes read before any lane writes back), but
+  // only while the packet stays in original program order -- see
+  // docs/HARDWARE_CONTRACT.md section 4.1.
+  bool AllowIntraPacketWAR = true;
+  // Ablation switches. Both default to the correct behaviour; they exist so a
+  // sweep can measure what each one is worth rather than assert it.
+  bool PacketizeFP = true;          // FP ops may occupy worker lanes
+  bool DebugInstrsTransparent = true;  // DBG_VALUE does not break a packet
   bool EmitSingleInstructionHints = false;
   bool PacketizePCRelative = false;
 };

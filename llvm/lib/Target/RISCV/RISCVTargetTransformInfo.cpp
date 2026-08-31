@@ -2810,11 +2810,74 @@ void RISCVTTIImpl::getUnrollingPreferences(
     OptimizationRemarkEmitter *ORE) const {
   if (ST->hasStarbugVLIW()) {
     const auto Cfg = RISCVVLIW::StarbugVLIWConfig::fromCommandLine();
+    const SCEV *BackedgeCount = SE.getBackedgeTakenCount(L);
+    const auto *ConstBackedgeCount = dyn_cast<SCEVConstant>(BackedgeCount);
+    const bool HasConstTripCount = ConstBackedgeCount &&
+                                   !ConstBackedgeCount->getAPInt().isNegative();
 
-    UP.Threshold = std::max(UP.Threshold, Cfg.Unroll.Threshold);
-    UP.PartialThreshold = std::max(UP.PartialThreshold, Cfg.Unroll.PartialThreshold);
-    UP.MaxPercentThresholdBoost =
-        std::max(UP.MaxPercentThresholdBoost, Cfg.Unroll.MaxPercentThresholdBoost);
+    uint64_t ConstTripCount = 0;
+    if (HasConstTripCount) {
+      const APInt TripCountAP = ConstBackedgeCount->getAPInt() + 1;
+      ConstTripCount =
+          TripCountAP.getLimitedValue(std::numeric_limits<uint64_t>::max());
+    }
+
+    SmallVector<BasicBlock *, 4> ExitingBlocks;
+    L->getExitingBlocks(ExitingBlocks);
+    const bool HasSimpleCFG = ExitingBlocks.size() <= 2 && L->getNumBlocks() <= 4;
+
+    bool HasVectorOps = false;
+    bool HasLoweredCalls = false;
+    const bool IsVectorized = getBooleanLoopAttribute(L, "llvm.loop.isvectorized");
+    for (auto *BB : L->getBlocks()) {
+      for (auto &I : *BB) {
+        if (IsVectorized &&
+            (I.getType()->isVectorTy() ||
+             llvm::any_of(I.operand_values(),
+                          [](Value *V) { return V->getType()->isVectorTy(); }))) {
+          HasVectorOps = true;
+          break;
+        }
+
+        if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
+          if (const Function *F = cast<CallBase>(I).getCalledFunction()) {
+            if (!isLoweredToCall(F))
+              continue;
+          }
+          HasLoweredCalls = true;
+          break;
+        }
+      }
+      if (HasVectorOps || HasLoweredCalls)
+        break;
+    }
+
+    const bool EnableAggressiveConstUnroll =
+        HasConstTripCount && ConstTripCount > 0 && HasSimpleCFG &&
+        !HasLoweredCalls && !HasVectorOps;
+
+    // Safety guard: keep runtime-trip loops on conservative defaults.
+    // Starbug's aggressive runtime unroll settings can produce wrong-code
+    // on some RV32 loops (observed as bad pointer materialization).
+    //
+    // Also avoid forcing Starbug's aggressive knobs on call-heavy/control-flow
+    // loops (e.g. outer driver loops that call kernels), which are
+    // particularly brittle with large forced-unroll settings.
+    if (EnableAggressiveConstUnroll) {
+      UP.Threshold = std::max(UP.Threshold, Cfg.Unroll.Threshold);
+      UP.PartialThreshold =
+          std::max(UP.PartialThreshold, Cfg.Unroll.PartialThreshold);
+      UP.MaxPercentThresholdBoost = std::max(
+          UP.MaxPercentThresholdBoost, Cfg.Unroll.MaxPercentThresholdBoost);
+      UP.DefaultUnrollRuntimeCount = Cfg.Unroll.DefaultUnrollFactor;
+      UP.MaxCount = std::max(UP.MaxCount, Cfg.Unroll.MaxUnrollFactor);
+      UP.MaxUpperBound = std::max(UP.MaxUpperBound, Cfg.Unroll.MaxUnrollFactor);
+      UP.FullUnrollMaxCount =
+          std::max(UP.FullUnrollMaxCount, Cfg.Unroll.MaxUnrollFactor);
+      UP.MaxIterationsCountToAnalyze =
+          std::max(UP.MaxIterationsCountToAnalyze, Cfg.Unroll.MaxUnrollFactor);
+    }
+
     UP.OptSizeThreshold = std::numeric_limits<unsigned>::max();
     UP.PartialOptSizeThreshold = std::numeric_limits<unsigned>::max();
 
@@ -2834,16 +2897,14 @@ void RISCVTTIImpl::getUnrollingPreferences(
     UP.SCEVExpansionBudget =
         std::max(UP.SCEVExpansionBudget, Cfg.Unroll.SCEVExpansionBudget);
 
-    UP.DefaultUnrollRuntimeCount = Cfg.Unroll.DefaultUnrollFactor;
-    UP.MaxCount = std::max(UP.MaxCount, Cfg.Unroll.MaxUnrollFactor);
-    UP.MaxUpperBound = std::max(UP.MaxUpperBound, Cfg.Unroll.MaxUnrollFactor);
-    UP.FullUnrollMaxCount =
-        std::max(UP.FullUnrollMaxCount, Cfg.Unroll.MaxUnrollFactor);
-    UP.MaxIterationsCountToAnalyze =
-        std::max(UP.MaxIterationsCountToAnalyze, Cfg.Unroll.MaxUnrollFactor);
-    if (Cfg.Unroll.ForceUnroll) {
+    if (Cfg.Unroll.ForceUnroll && EnableAggressiveConstUnroll) {
+      const unsigned SafeTripCount =
+          ConstTripCount > std::numeric_limits<unsigned>::max()
+              ? std::numeric_limits<unsigned>::max()
+              : static_cast<unsigned>(ConstTripCount);
       UP.Force = true;
-      UP.Count = Cfg.Unroll.DefaultUnrollFactor;
+      UP.Count = std::max(
+          1u, std::min<unsigned>(Cfg.Unroll.DefaultUnrollFactor, SafeTripCount));
     }
     return;
   }
